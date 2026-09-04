@@ -1,0 +1,7 @@
+/target/
+/node_modules/
+# Existing local Codex bootstrap; not part of the Rust application.
+/package.json
+/package-lock.json
+*.partial
+*.log
