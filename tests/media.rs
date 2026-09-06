@@ -53,6 +53,73 @@ fn generate(path: &std::path::Path, audio: bool, multitrack: bool) {
     );
 }
 #[tokio::test]
+async fn conversion_scan_skips_resolve_generated_trees_but_keeps_unknown_media() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path();
+    generate(&source.join("extensionless"), false, false);
+    fs::write(source.join("broken.mp4"), b"not valid video").unwrap();
+    let folders = [
+        "CacheClip",
+        "ProxyMedia",
+        "Proxy",
+        ".gallery",
+        "Resolve Project Backups",
+        "nested/cacheclip",
+    ];
+    for folder in folders {
+        fs::create_dir_all(source.join(folder)).unwrap();
+        fs::write(source.join(folder).join("generated.dvcc"), b"cache").unwrap();
+    }
+    let cancel = Cancel::default();
+    let mut checked = Vec::new();
+    let clips = discovery::scan_with_progress(source, &cancel, true, |count, path| {
+        checked.push((count, path.to_path_buf()));
+    })
+    .await
+    .unwrap();
+    assert_eq!(clips.len(), 2);
+    assert_eq!(checked.len(), 2);
+    for (index, clip) in clips.iter().enumerate() {
+        assert_eq!(checked[index], (index, clip.relative.clone()));
+    }
+    assert!(
+        clips
+            .iter()
+            .any(|c| c.relative == std::path::Path::new("extensionless") && c.editing)
+    );
+    assert!(
+        clips
+            .iter()
+            .any(|c| c.relative == std::path::Path::new("broken.mp4") && c.probe_error.is_some())
+    );
+    // Archival must still discover everything; explicitly selecting a generated folder is allowed.
+    assert_eq!(discovery::scan(source, &cancel).await.unwrap().len(), 8);
+    assert_eq!(
+        discovery::scan_with_progress(&source.join("CacheClip"), &cancel, true, |_, _| {})
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    cancel.request();
+    assert!(
+        discovery::scan_with_progress(source, &cancel, true, |_, _| {})
+            .await
+            .is_err()
+    );
+}
+
+#[test]
+fn conversion_plan_accepts_video_without_container_duration() {
+    let probe: media::Probe = serde_json::from_value(serde_json::json!({
+        "streams": [{"index": 0, "codec_type": "video", "codec_name": "hevc", "width": 3840, "height": 2160, "pix_fmt": "yuv420p10le"}],
+        "format": {}
+    })).unwrap();
+    assert!(probe.video().is_some_and(|v| v.pix_fmt.is_some()));
+    assert_eq!(probe.duration(), 0.0);
+}
+
+#[tokio::test]
 async fn generated_media_ingest_retries_and_content_proof() {
     let d = tempfile::tempdir().unwrap();
     for folder in ["source", "archive", "editing", "jobs"] {

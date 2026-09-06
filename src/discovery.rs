@@ -7,13 +7,44 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 pub async fn scan(path: &Path, cancel: &Cancel) -> Result<Vec<Candidate>> {
+    scan_with_progress(path, cancel, false, |_, _| {}).await
+}
+
+/// Conversion scans omit nested Resolve-generated folders. Archive scans retain every original.
+/// The callback runs before each probe so even a slow file is identified to the user.
+pub async fn scan_with_progress(
+    path: &Path,
+    cancel: &Cancel,
+    exclude_resolve_generated: bool,
+    mut progress: impl FnMut(usize, &Path),
+) -> Result<Vec<Candidate>> {
     let root =
-        Root::source(path).context("Source unavailable. Select the card's current mount.")?;
+        Root::source(path).context("Source unavailable. Check access to the selected folder.")?;
     let mut items = Vec::new();
     for entry in walkdir::WalkDir::new(path)
         .follow_links(false)
         .same_file_system(true)
         .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            !(exclude_resolve_generated
+                && entry.depth() > 0
+                && entry.file_type().is_dir()
+                && [
+                    "CacheClip",
+                    "ProxyMedia",
+                    "Proxy",
+                    ".gallery",
+                    "Resolve Project Backups",
+                ]
+                .iter()
+                .any(|name| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(name)
+                }))
+        })
     {
         cancel.check()?;
         let entry = entry.context("Could not enumerate source. Check card access and rescan.")?;
@@ -21,6 +52,7 @@ pub async fn scan(path: &Path, cancel: &Cancel) -> Result<Vec<Candidate>> {
             continue;
         }
         let relative = entry.path().strip_prefix(path)?.to_path_buf();
+        progress(items.len(), &relative);
         let file = root.read(&relative)?;
         let identity = Identity::of(&file.metadata()?);
         let ext = entry

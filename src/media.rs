@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::{
     fs::File,
     os::fd::{AsRawFd, RawFd},
+    path::PathBuf,
     process::Stdio,
     time::Duration,
 };
@@ -14,6 +15,71 @@ use tokio::{
 };
 
 pub const PROFILE: &str = "primary-motion-video-copy/all-audio-pcm_s24le/mov/full-decode/v1";
+
+/// Locate the media tools shipped with an installation before consulting PATH.
+/// `RESOLVE_INGEST_FFMPEG_DIR` is useful for portable installs and development.
+pub fn tool_path(tool: &str) -> PathBuf {
+    let names = [tool.to_string(), format!("{tool}.bin")];
+    let mut dirs = Vec::new();
+    if let Some(dir) = std::env::var_os("RESOLVE_INGEST_FFMPEG_DIR") {
+        dirs.push(PathBuf::from(dir));
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        dirs.push(parent.join("../libexec/resolve-ingest"));
+        dirs.push(parent.join("ffmpeg"));
+    }
+    dirs.push(PathBuf::from("/usr/libexec/resolve-ingest"));
+    for dir in dirs {
+        for name in &names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from(tool)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn probe_deadline_reaps_child_without_canceling_later_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let cancel = Cancel::default();
+        let start = std::time::Instant::now();
+        let result = process_with_timeout(
+            "sh",
+            &[
+                "-c".into(),
+                "echo $$ > \"$1\"; exec sleep 30".into(),
+                "probe-test".into(),
+                pid_file.to_str().unwrap().into(),
+            ],
+            &[],
+            None,
+            &cancel,
+            None,
+            Some(Duration::from_millis(200)),
+        )
+        .await;
+        assert!(result.err().unwrap().to_string().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", pid.trim())).exists(),
+            "Timed-out child was not reaped"
+        );
+        assert!(!cancel.requested());
+        process("true", &[], &[], None, &cancel, None)
+            .await
+            .unwrap();
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Stream {
     pub index: u32,
@@ -112,8 +178,21 @@ pub async fn process(
     cancel: &Cancel,
     progress_target: Option<(&Events, usize, &str, f64)>,
 ) -> Result<ProcessOutput> {
+    process_with_timeout(tool, args, files, lock, cancel, progress_target, None).await
+}
+
+async fn process_with_timeout(
+    tool: &str,
+    args: &[String],
+    files: &[&File],
+    lock: Option<RawFd>,
+    cancel: &Cancel,
+    progress_target: Option<(&Events, usize, &str, f64)>,
+    timeout: Option<Duration>,
+) -> Result<ProcessOutput> {
     cancel.check()?;
-    let mut command = Command::new(tool);
+    let executable = tool_path(tool);
+    let mut command = Command::new(&executable);
     command
         .args(args)
         .stdin(Stdio::null())
@@ -142,9 +221,12 @@ pub async fn process(
             Ok(())
         });
     }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("Cannot start {tool}. Install FFmpeg and ffprobe, then retry."))?;
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "Cannot start {}. Install FFmpeg and ffprobe, then retry.",
+            executable.display()
+        )
+    })?;
     let stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let err = tokio::spawn(async move {
@@ -181,11 +263,13 @@ pub async fn process(
         }
         Ok::<_, std::io::Error>(captured)
     });
+    let began = std::time::Instant::now();
     let status = loop {
         tokio::select! {
             status = child.wait() => break status?,
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                if cancel.requested() {
+                let timed_out = timeout.is_some_and(|limit| began.elapsed() >= limit);
+                if cancel.requested() || timed_out {
                     if let Some(pid) = child.id() {
                         // SAFETY: this is our live supervised child; termination is followed by wait.
                         unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
@@ -194,7 +278,10 @@ pub async fn process(
                         child.kill().await?;
                         child.wait().await?;
                     }
-                    let _ = out.await; let _ = err.await; cancel.check()?; unreachable!();
+                    let _ = out.await;
+                    let _ = err.await;
+                    cancel.check()?;
+                    anyhow::bail!("{tool} timed out after {} seconds. Check file access and retry its probe.", timeout.unwrap().as_secs_f64());
                 }
             }
         }
@@ -223,7 +310,16 @@ pub async fn probe(file: &File, lock: Option<RawFd>, cancel: &Cancel) -> Result<
         "json",
     ]);
     args.push(fd_path(file));
-    let out = process("ffprobe", &args, &[file], lock, cancel, None).await?;
+    let out = process_with_timeout(
+        "ffprobe",
+        &args,
+        &[file],
+        lock,
+        cancel,
+        None,
+        Some(Duration::from_secs(30)),
+    )
+    .await?;
     let probe: Probe = serde_json::from_slice(&out.stdout).context("Invalid ffprobe response")?;
     ensure!(!probe.streams.is_empty(), "No media streams found");
     Ok(probe)

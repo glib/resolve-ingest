@@ -8,7 +8,7 @@ This is an initial implementation, not a production-qualified release. Real Acti
 
 ## Build and run
 
-Requires Linux, Rust 1.88+, GTK 4.12+, libadwaita 1.5+, and FFmpeg/ffprobe with the MOV muxer and `pcm_s24le` encoder. Ubuntu 24.04+ or Fedora with those development packages can build it.
+Requires Linux, Rust 1.88+, GTK 4.12+, libadwaita 1.5+, and FFmpeg/ffprobe with the MOV muxer and `pcm_s24le` encoder. Ubuntu 24.04+ or Fedora with those development packages can build it. The application first looks for packaged tools in `libexec/resolve-ingest` beside the installation, then uses `RESOLVE_INGEST_FFMPEG_DIR`, then falls back to `ffmpeg` and `ffprobe` on `PATH`.
 
 ```sh
 # Ubuntu
@@ -20,6 +20,8 @@ cargo run --release
 cargo run -- doctor
 cargo run -- demo       # interactive 1,000-row prototype; no media writes
 make install           # installs to ~/.local, or specify PREFIX=/usr/local
+# Optional: install an LGPL-only FFmpeg build with HEVC decoding alongside it
+make install FFMPEG_DIR=/path/to/ffmpeg/bin
 ```
 
 Choose **Archive + convert** for camera ingest, then choose a source folder and configure archive/editing destinations in Settings. **Scan folder** fills a compact table with recording date, file type, size, duration, and status. Click column headings to sort; the initial order is newest first. Filter by file type or a **Since YYYY-MM-DD** date, then use **Select shown only** to exclude older or hidden files. Filtering alone preserves your selection. **Preview output files** checks space and adds the output-filename column; **Archive & convert** starts the selected work. A remembered folder never starts work automatically. See [storage setup](docs/storage.md).
@@ -27,6 +29,8 @@ Choose **Archive + convert** for camera ingest, then choose a source folder and 
 For footage already copied to disk, choose **Convert existing files**. **Alongside originals** writes `clip.mp4.mov` beside `clip.mp4`; **Use editing destination** writes under the folder configured in Settings. Sources are kept, and existing outputs are never overwritten. Scan, select videos, choose **Preview output files**, then **Convert files**. This workflow does not need a NAS or create another archive. History supports rechecking and retrying recorded conversions.
 
 Recording dates prefer recognizable timestamps in filenames (including DJI's `YYYYMMDDHHMMSS` and `YYYYMMDD_HHMMSS`), then embedded media creation time. A `*` marks file-modification-time fallback; the date tooltip identifies its source and timezone. Filename dates use the camera clock without guessing a timezone.
+
+Scans show the current file and number checked. **Convert existing files** skips nested Resolve-generated `CacheClip`, `ProxyMedia`, `Proxy`, `.gallery`, and `Resolve Project Backups` folders; selecting one of those folders directly still scans it. Archive scans retain all files. A media probe has a 30-second deadline; failures stay visible for retry. Cancellation and timeouts wait for child exit, which a stalled filesystem can delay.
 
 History offers report export, recovery, partial-file inspection, and explicit cleanup. Cancel waits for active workers to stop; a stalled filesystem can delay cancellation. Verified results are never deleted by cleanup.
 

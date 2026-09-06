@@ -14,12 +14,13 @@ Implemented on 2026-09-04. This is a working initial application with a desktop 
 - Child supervision, inherited process lock, SIGTERM/escalation/wait cancellation, parent-death handling, blocked-share status, and two bounded retries for transient I/O errors.
 - Three bounded processing lanes with two active assets: concurrent archive/local copies, one queued conversion/verification worker, local-input/archive checksum matching before editing publication, temporary-space reservation, journaled staging cleanup, and separate live activity lines.
 - Release build, desktop entry/icon, user-prefix installation Makefile, CI, setup/storage documentation, and a reproducible real-sample harness.
+- Media-tool resolution prefers an installation-local `libexec/resolve-ingest/ffmpeg` and `ffprobe`, supports `RESOLVE_INGEST_FFMPEG_DIR`, and falls back to PATH. The Makefile can install a separately built LGPL-only FFmpeg runtime without linking it into the MIT application.
 
 ## Automated checks performed
 
-`cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`, and `cargo build --release` pass. There are 24 top-level tests: 14 core tests, six pipeline tests, one recording-metadata test, one generated-media integration workflow, and two process-supervision tests. The ignored helper test is invoked in a subprocess by the parent-death test; it is not an unexecuted acceptance test.
+`cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`, and `cargo build --release` pass. There are 26 top-level tests: 14 core tests, six pipeline tests, one recording-metadata test, two generated-media integration workflows, one probe-deadline test, and two process-supervision tests. The ignored helper test is invoked in a subprocess by the parent-death test; it is not an unexecuted acceptance test.
 
-Conversion-only testing verifies files written beside unchanged originals, no archive/staging copies, recorded input evidence, refusal to overwrite existing outputs, rechecking a completed conversion, and rejection after source modification. Metadata testing covers both filename timestamp formats, invalid-date fallback, embedded creation times, modification-time labeling, and case-insensitive file types.
+Conversion-only testing verifies files written beside unchanged originals, no archive/staging copies, recorded input evidence, refusal to overwrite existing outputs, rechecking a completed conversion, and rejection after source modification. Conversion scans also verify exclusion of Resolve-generated subfolders while archive scans retain them, discovery of extensionless footage, visible malformed-file errors, progress, and cancellation. The probe-deadline test verifies child reaping and that later work remains usable. Metadata testing covers both filename timestamp formats, invalid-date fallback, embedded creation times, modification-time labeling, and case-insensitive file types.
 
 The pipeline tests hold the archive lane back and prove that two local conversions finish independently without publishing early. They check one worker per lane, the two-asset bound, journaled evidence before publication, archive failure after conversion, cancellation/draining, partial cleanup, local-input replacement rejection, and compatibility/recovery for old attempts and new staging states.
 
@@ -42,6 +43,8 @@ This evidence applies to this one sample and the tested tool version. It does no
 The native desktop was launched under Xvfb with a software renderer. The 1,000-row synthetic prototype rendered and responded to controls; the native folder picker opened. Normal and constrained screenshots are in [design](design/). The reduced-width layout wraps status/error text and preserves visible actions. This is a smoke check, not an observed human usability or assistive-technology acceptance test. GTK portal/graphics warnings from the container do not validate native Wayland/portal integration.
 
 A three-clip desktop ingest completed with the new pipeline. [Review](design/pipeline-review.png) shows the temporary-space allowance; [active processing](design/pipeline-active.png) shows simultaneous archive and local-copy progress with the cancel control still visible.
+
+The conversion-scan fix was also exercised in an isolated desktop against the user’s Videos folder: it completed within the five-second observation window and displayed 14 footage files, excluding the nested Resolve-generated folders (including 4,670 `.dvcc` cache files). This was a read-only scan; no footage was converted or changed.
 
 Still required before release:
 

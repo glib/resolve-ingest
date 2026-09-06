@@ -25,6 +25,7 @@ enum Command {
     Probe(usize, Settings, Candidate),
 }
 enum Reply {
+    ScanProgress(usize, PathBuf),
     Scan(Vec<Candidate>),
     Plan(Box<Batch>),
     Finished(Box<Batch>),
@@ -132,7 +133,14 @@ fn worker(rx: mpsc::Receiver<Command>, tx: mpsc::Sender<Reply>, events: Events, 
             let result: anyhow::Result<Reply> = rt.block_on(async {
                 Ok(match command {
                     Command::PrepareArchivedEditing(id, index) => { let mut batch = jobs.load(&id)?; pipeline::prepare_archived_editing(&mut jobs, &mut batch, index, &cancel, &events).await?; Reply::Finished(Box::new(batch)) }
-                    Command::Scan(s) => { let mut c = discovery::scan(&s.source, &cancel).await?; if s.workflow == Workflow::Convert { for c in &mut c { c.selected = c.editing; } } Reply::Scan(c) },
+                    Command::Scan(s) => {
+                        let converting = s.workflow == Workflow::Convert;
+                        let mut c = discovery::scan_with_progress(&s.source, &cancel, converting, |count, path| {
+                            let _ = tx.send(Reply::ScanProgress(count, path.to_path_buf()));
+                        }).await?;
+                        if converting { for c in &mut c { c.selected = c.editing; } }
+                        Reply::Scan(c)
+                    },
                     Command::Plan(mut s, c, alongside) => { if s.workflow == Workflow::Convert && alongside { s.editing = Some(Destination::select(s.source.clone(), false)?); } Reply::Plan(Box::new(pipeline::plan(s, c, &cancel).await?)) },
                     Command::Start(mut b) => { jobs.save(&b)?; pipeline::run(&mut jobs, &mut b, None, &cancel, &events).await?; Reply::Finished(b) }
                     Command::Retry(id, only) => { let mut b = jobs.load(&id)?; pipeline::run(&mut jobs, &mut b, only, &cancel, &events).await?; Reply::Finished(Box::new(b)) }
@@ -676,11 +684,22 @@ fn build(app: &adw::Application, demo: bool) {
             }
         }
         for reply in rx.try_iter() {
+            if let Reply::ScanProgress(count, path) = reply {
+                if !v.state.borrow().cancel.requested() {
+                    v.stage.set_text(&format!(
+                        "Scanning · {count} files checked · {}",
+                        path.display()
+                    ));
+                    v.progress.pulse();
+                }
+                continue;
+            }
             v.state.borrow_mut().busy = false;
             v.state.borrow_mut().activities.clear();
             // The reply follows all worker events. Discard any that arrived after this tick's event drain.
             for _ in erx.try_iter() {}
             match reply {
+                Reply::ScanProgress(..) => unreachable!(),
                 Reply::Scan(c) => {
                     v.stage.set_text("Select files, then preview their outputs");
                     v.progress.set_fraction(0.);
@@ -691,7 +710,12 @@ fn build(app: &adw::Application, demo: bool) {
                     drop(s);
                     refresh_rows(&v);
                     rebuild_types(&v);
-                    v.banner.set_text("Sort by clicking a column heading. Filter by type or date, then use Select shown only. * marks a modification-date fallback.");
+                    let note = if v.state.borrow().settings.workflow == Workflow::Convert {
+                        " Resolve cache, proxy, gallery, and project-backup subfolders were excluded."
+                    } else {
+                        ""
+                    };
+                    v.banner.set_text(&format!("Sort by clicking a column heading. Filter by type or date, then use Select shown only. * marks a modification-date fallback.{note}"));
                 }
                 Reply::Plan(b) => {
                     v.stage

@@ -569,7 +569,7 @@ async fn plan_conversion(
             "A selected file could not be probed. Select video files or retry its probe.",
         )?;
         ensure!(
-            probe.video().is_some_and(|v| v.pix_fmt.is_some()) && probe.duration() > 0.,
+            probe.video().is_some(),
             "Select decodable video files for conversion: {}",
             c.relative.display()
         );
