@@ -1,0 +1,19 @@
+{
+  "source_file": "DJI_20260826184226_0027_D.MP4",
+  "status": "Completed",
+  "source_bytes": 2614287444,
+  "archive_sha256": "e692e0655878e71e2439b6bd479faf39e6b6076fd9958c2f252718d6e2f85013",
+  "output_sha256": "f1708c4131cd173179b11ca46482c6e115c34c3ef59e32736410e419cef7f6f2",
+  "output_bytes": 2618041425,
+  "matches_previous_validated_original": true,
+  "matches_previous_validated_mov": true,
+  "checks": [
+    "SHA-256 readback through client filesystem",
+    "Expected stream manifest, formats, color, rotation, and timing tolerances",
+    "Full decode of all expected video/audio streams; not a content-equivalence proof",
+    "Verified local conversion input SHA-256 matches the verified archive"
+  ],
+  "temporary_local_copy_removed": true,
+  "local_filesystem_only": true,
+  "throughput_benchmark": false
+}

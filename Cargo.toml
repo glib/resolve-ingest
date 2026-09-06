@@ -1,0 +1,38 @@
+[package]
+name = "resolve-ingest"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Verified camera archives and PCM editing copies for Linux"
+license = "MIT"
+
+[features]
+default = ["desktop"]
+desktop = ["dep:gtk", "dep:adw"]
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+libc = "0.2"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "time", "macros", "signal", "sync"] }
+toml = "0.9"
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"
+gtk = { package = "gtk4", version = "0.10", features = ["v4_12"], optional = true }
+adw = { package = "libadwaita", version = "0.8", features = ["v1_5"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+lto = "thin"
+strip = true

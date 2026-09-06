@@ -1,0 +1,15 @@
+{
+  "source_file": "DJI_20260826184226_0027_D.MP4",
+  "source_bytes": 2614287444,
+  "source_sha256": "e692e0655878e71e2439b6bd479faf39e6b6076fd9958c2f252718d6e2f85013",
+  "output_sha256": "f1708c4131cd173179b11ca46482c6e115c34c3ef59e32736410e419cef7f6f2",
+  "output_bytes": 2618041425,
+  "decoded_video_frames": 6806,
+  "all_decoded_video_frame_hashes_match": true,
+  "normalized_pcm_sha256": "SHA256=2e23bb364037f10f6c9b53a66026a27ad09573334f98e5344e9fc49cee416796",
+  "normalized_pcm_matches": true,
+  "elapsed_seconds": 292.0,
+  "ffmpeg_version": "ffmpeg version n8.1.2-50-g1a748fe2cd-20260904 Copyright (c) 2000-2026 the FFmpeg developers",
+  "local_filesystem_only": true,
+  "resolve_import_tested": false
+}
