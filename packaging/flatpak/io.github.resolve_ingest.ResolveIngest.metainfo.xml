@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.resolve_ingest.ResolveIngest</id>
+  <name>Resolve Ingest</name>
+  <summary>Archive camera originals and prepare verified PCM editing copies</summary>
+  <developer id="io.github.resolve_ingest">
+    <name>Resolve Ingest contributors</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <launchable type="desktop-id">io.github.resolve_ingest.ResolveIngest.desktop</launchable>
+  <categories>
+    <category>AudioVideo</category>
+  </categories>
+  <description>
+    <p>
+      Resolve Ingest securely archives camera media, checks the copied bytes,
+      and creates DaVinci Resolve editing copies with unchanged video and
+      24-bit PCM audio.
+    </p>
+    <p>
+      It supports existing local footage as well as originals from an
+      OS-mounted CIFS share, and keeps a local journal for recovery and retry.
+    </p>
+  </description>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-09-06"/>
+  </releases>
+</component>

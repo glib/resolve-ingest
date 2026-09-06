@@ -24,6 +24,88 @@ make install           # installs to ~/.local, or specify PREFIX=/usr/local
 make install FFMPEG_DIR=/path/to/ffmpeg/bin
 ```
 
+## Install as a user Flatpak on Bazzite
+
+The Flatpak build is designed to run from the existing Fedora Distrobox. It
+does not install files into `/usr`, layer the Bazzite image, or use the
+Distrobox at runtime. The bundle contains the Rust application and its
+FFmpeg/ffprobe runtime tools.
+
+Prerequisites are a working host `flatpak` command, a Flathub remote, and
+`flatpak-builder` installed inside the Distrobox:
+
+```sh
+sudo dnf install flatpak-builder
+distrobox-host-exec flatpak remote-add --if-not-exists --user flathub \
+  https://dl.flathub.org/repo/flathub.flatpakrepo
+```
+
+The `--user` is intentional: adding a system-wide remote from inside a
+Distrobox can fail with “Unable to connect to system bus”, while this workflow
+only needs the current user's Flatpak installation.
+
+From the repository root, build and install/update the current user's
+Flatpak with one command:
+
+```sh
+./install-flatpak.sh
+```
+
+The script uses `--force-clean`, installs the current stable GNOME 50
+runtime/SDK (the Freedesktop-based runtime that supplies GTK4 and
+libadwaita) and Rust SDK dependencies from Flathub as needed, and installs
+only the application for the current user. After code changes, run the same
+command again. The
+application then appears in KDE's launcher as **Resolve Ingest**, or can be
+started with:
+
+```sh
+distrobox-host-exec flatpak run io.github.resolve_ingest.ResolveIngest
+```
+
+If `Cargo.lock` changes, refresh the checked-in offline crate sources before
+building:
+
+```sh
+python3 packaging/flatpak/generate-cargo-sources.py
+```
+
+By default the sandbox can read and write files in the user's home directory.
+The app's Flatpak-scoped settings and journal are under
+`~/.var/app/io.github.resolve_ingest.ResolveIngest/`, not the host's ordinary
+`~/.config` and `~/.local/share` directories. For a specific OS-mounted
+media directory outside home, grant only that path, for example:
+
+```sh
+distrobox-host-exec flatpak override --user \
+  --filesystem=/mnt/resolve-archive:rw \
+  --filesystem=/run/media/$USER/ResolveMedia:rw \
+  io.github.resolve_ingest.ResolveIngest
+```
+
+Use only the path(s) that actually contain the source, archive, or editing
+folders. The archive workflow requires a real OS-mounted CIFS/SMB filesystem;
+the app intentionally rejects `smb://` locations exposed by Dolphin/GVfs.
+If an SMB share is not visible, first check the host mount with
+`findmnt -t cifs,smb3`, then check the app's effective permissions with
+`distrobox-host-exec flatpak info --show-permissions io.github.resolve_ingest.ResolveIngest`.
+`distrobox-host-exec flatpak run --command=sh io.github.resolve_ingest.ResolveIngest` can be used
+to inspect the sandbox's `/proc/self/mountinfo` and the mounted path. Mount
+the share at a stable host path such as `/mnt/resolve-archive`, then add the
+narrow override above. Do not use the GVfs FUSE path under
+`/run/user/$UID/gvfs`; it is unsupported by the storage checks as well as
+being unsuitable for this workflow.
+
+To remove the application while keeping its Flatpak-scoped user data and all
+shared runtimes:
+
+```sh
+./uninstall-flatpak.sh
+```
+
+To explicitly remove that app data too, use `./uninstall-flatpak.sh
+--delete-data`. This does not remove unrelated runtimes.
+
 Choose **Archive + convert** for camera ingest, then choose a source folder and configure archive/editing destinations in Settings. **Scan folder** fills a compact table with recording date, file type, size, duration, and status. Click column headings to sort; the initial order is newest first. Filter by file type or a **Since YYYY-MM-DD** date, then use **Select shown only** to exclude older or hidden files. Filtering alone preserves your selection. **Preview output files** checks space and adds the output-filename column; **Archive & convert** starts the selected work. A remembered folder never starts work automatically. See [storage setup](docs/storage.md).
 
 For footage already copied to disk, choose **Convert existing files**. **Alongside originals** writes `clip.mp4.mov` beside `clip.mp4`; **Use editing destination** writes under the folder configured in Settings. Sources are kept, and existing outputs are never overwritten. Scan, select videos, choose **Preview output files**, then **Convert files**. This workflow does not need a NAS or create another archive. History supports rechecking and retrying recorded conversions.

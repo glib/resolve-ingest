@@ -1,0 +1,58 @@
+app-id: io.github.resolve_ingest.ResolveIngest
+# GNOME 50 is the current stable Freedesktop-based desktop runtime that
+# supplies the GTK4/libadwaita stack used by this application.
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: resolve-ingest
+
+# GTK uses the desktop display sockets. Media locations are deliberately not
+# exposed with --filesystem=host; home is the default scope for local files.
+# Add a narrowly-scoped override for an OS-mounted CIFS path under /mnt or
+# /run/media when needed (see README.md).
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --filesystem=home
+
+modules:
+  # The application launches both tools itself. They must be inside the
+  # sandbox, so a host/Distrobox FFmpeg installation is never a runtime
+  # dependency.
+  - name: ffmpeg
+    buildsystem: simple
+    build-commands:
+      - ./configure --prefix=/app --disable-debug --disable-doc --disable-network --disable-autodetect --disable-shared --enable-static --disable-ffplay --disable-indevs --disable-outdevs --enable-protocol=file,pipe
+      - make -j2 ffmpeg ffprobe
+      - install -Dm755 ffmpeg /app/libexec/resolve-ingest/ffmpeg
+      - install -Dm755 ffprobe /app/libexec/resolve-ingest/ffprobe
+    sources:
+      - type: archive
+        archive-type: tar-xz
+        url: https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz
+        sha256: cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635
+
+  - name: resolve-ingest
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/resolve-ingest/cargo
+        CARGO_NET_OFFLINE: 'true'
+    build-commands:
+      - cargo build --offline --locked --workspace --all-features --release
+      - install -Dm755 target/release/resolve-ingest /app/bin/resolve-ingest
+      - install -Dm644 packaging/flatpak/io.github.resolve_ingest.ResolveIngest.desktop /app/share/applications/io.github.resolve_ingest.ResolveIngest.desktop
+      - install -Dm644 packaging/flatpak/io.github.resolve_ingest.ResolveIngest.svg /app/share/icons/hicolor/scalable/apps/io.github.resolve_ingest.ResolveIngest.svg
+      - install -Dm644 packaging/flatpak/io.github.resolve_ingest.ResolveIngest.metainfo.xml /app/share/metainfo/io.github.resolve_ingest.ResolveIngest.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - .flatpak-builder
+          - node_modules
+      - cargo-sources.json

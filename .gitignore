@@ -1,5 +1,6 @@
 /target/
 /node_modules/
+__pycache__/
 # Existing local Codex bootstrap; not part of the Rust application.
 /package.json
 /package-lock.json
