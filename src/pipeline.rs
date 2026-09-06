@@ -244,7 +244,16 @@ pub async fn run(
     cancel: &Cancel,
     events: &Events,
 ) -> Result<()> {
-    run_with_lanes(jobs, batch, only, cancel, events, workers::Lanes::default()).await
+    let workflow = batch.settings.workflow;
+    run_with_lanes(
+        jobs,
+        batch,
+        only,
+        cancel,
+        events,
+        workers::Lanes::for_workflow(workflow),
+    )
+    .await
 }
 
 async fn run_with_lanes(

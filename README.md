@@ -34,7 +34,7 @@ Scans show the current file and number checked. **Convert existing files** skips
 
 History offers report export, recovery, partial-file inspection, and explicit cleanup. Cancel waits for active workers to stop; a stalled filesystem can delay cancellation. Verified results are never deleted by cleanup.
 
-With a local editing destination, archiving and local copying run concurrently. Each verified local copy queues for audio conversion immediately, while other copy work continues. There is one archive worker, one local-copy worker, one conversion/verification worker, and at most two assets in flight. Editing files are published only after their input matches the verified archive. Review includes temporary-copy space, and the footer shows each active worker separately. Successful local temporary copies are removed automatically; interrupted ones remain available for History cleanup. Shared editing destinations convert from the verified archive.
+With a local editing destination, archiving and local copying run concurrently. Each verified local copy queues for audio conversion immediately, while other copy work continues. Ingest uses one conversion/verification worker; Convert batches use two independent FFmpeg workers, so one file can be checked while another converts. The total in-flight bound remains two assets. Editing files are published only after their input matches the verified archive. Review includes temporary-copy space, and the footer shows each active worker separately. Successful local temporary copies are removed automatically; interrupted ones remain available for History cleanup. Shared editing destinations convert from the verified archive.
 
 ## Headless workflow
 

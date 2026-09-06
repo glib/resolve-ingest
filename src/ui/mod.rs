@@ -1400,7 +1400,7 @@ fn settings_dialog(v: &View) {
     for (title, subtitle) in [
         (
             "Processing",
-            "Local copies and archiving overlap. Audio conversion starts when each local copy is ready; editing files publish after archive verification.",
+            "Local copies and archiving overlap. Convert batches run up to two FFmpeg jobs at once; editing files publish after verification.",
         ),
         ("Video", "Keep the original codec without re-encoding"),
         (

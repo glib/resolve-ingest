@@ -75,6 +75,23 @@ impl Default for Lanes {
         }
     }
 }
+
+/// Conversion batches can overlap independent FFmpeg jobs. Ingest keeps a single
+/// editing lane because local staging, conversion, and archive publication are
+/// coordinated around the same bounded two-asset pipeline.
+impl Lanes {
+    pub(super) fn for_workflow(workflow: Workflow) -> Self {
+        let lanes = Self::default();
+        if workflow == Workflow::Convert {
+            Self {
+                editing: Arc::new(Semaphore::new(2)),
+                ..lanes
+            }
+        } else {
+            lanes
+        }
+    }
+}
 struct Activity {
     events: Events,
     lane: Lane,
