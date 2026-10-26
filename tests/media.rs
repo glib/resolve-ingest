@@ -92,8 +92,16 @@ async fn conversion_scan_skips_resolve_generated_trees_but_keeps_unknown_media()
             .iter()
             .any(|c| c.relative == std::path::Path::new("broken.mp4") && c.probe_error.is_some())
     );
-    // Archival must still discover everything; explicitly selecting a generated folder is allowed.
-    assert_eq!(discovery::scan(source, &cancel).await.unwrap().len(), 8);
+    // Archival discovers everything except hidden bookkeeping such as `.gallery` or AppleDouble
+    // `._` files; explicitly selecting a generated folder is allowed.
+    fs::write(source.join("._broken.mp4"), b"resource fork").unwrap();
+    fs::create_dir(source.join("System Volume Information")).unwrap();
+    fs::write(
+        source.join("System Volume Information/IndexerVolumeGuid"),
+        b"x",
+    )
+    .unwrap();
+    assert_eq!(discovery::scan(source, &cancel).await.unwrap().len(), 7);
     assert_eq!(
         discovery::scan_with_progress(&source.join("CacheClip"), &cancel, true, |_, _| {})
             .await
@@ -153,8 +161,10 @@ async fn generated_media_ingest_retries_and_content_proof() {
     );
     let settings = Settings {
         source: source.clone(),
-        archive: Some(Destination::select(d.path().join("archive"), false).unwrap()),
-        editing: Some(Destination::select(d.path().join("editing"), false).unwrap()),
+        archive: Some(Destination::select(d.path().join("archive")).unwrap()),
+        editing: Some(Destination::select(d.path().join("editing")).unwrap()),
+        // Keeps the optional full-decode pass covered; pipeline tests use the default fast check.
+        verify: resolve_ingest::settings::Verify::Full,
         ..Default::default()
     };
     candidates

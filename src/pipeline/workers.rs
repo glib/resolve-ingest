@@ -645,15 +645,18 @@ async fn convert_and_check(w: &Work, existing: bool, staged: Option<&Staged>) ->
     for notice in verification::structure(expected, &probe)? {
         w.save.apply(Change::Notice(notice)).await?;
     }
-    media::decode(
-        &ed.read(&path)?,
-        &probe,
-        w.lock,
-        &w.cancel,
-        &w.events,
-        w.save.index,
-    )
-    .await?;
+    let full = w.settings.verify == crate::settings::Verify::Full;
+    if full {
+        media::decode(
+            &ed.read(&path)?,
+            &probe,
+            w.lock,
+            &w.cancel,
+            &w.events,
+            w.save.index,
+        )
+        .await?;
+    }
     let mut evidence = verification::hash(
         ed.read(&path)?,
         &w.cancel,
@@ -668,10 +671,15 @@ async fn convert_and_check(w: &Work, existing: bool, staged: Option<&Staged>) ->
     if existing {
         verification::compare_hash(&evidence, w.item.output_evidence.as_ref().unwrap())?;
     }
-    evidence.checks.extend([
-        "Expected stream manifest, formats, color, rotation, and timing tolerances".into(),
-        "Full decode of all expected video/audio streams; not a content-equivalence proof".into(),
-    ]);
+    evidence
+        .checks
+        .push("Expected stream manifest, formats, color, rotation, and timing tolerances".into());
+    if full {
+        evidence.checks.push(
+            "Full decode of all expected video/audio streams; not a content-equivalence proof"
+                .into(),
+        );
+    }
     w.save
         .apply(Change::OutputEvidence(evidence.clone()))
         .await?;

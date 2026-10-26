@@ -59,7 +59,7 @@ impl std::fmt::Display for Stage {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Identity {
     pub dev: u64,
     pub ino: u64,
@@ -84,7 +84,7 @@ impl Identity {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Candidate {
     pub relative: PathBuf,
     pub identity: Identity,
@@ -93,9 +93,15 @@ pub struct Candidate {
     pub selected: bool,
     pub editing: bool,
     pub sidecar_for: Option<PathBuf>,
+    /// Size plus head/tail hash; recognizes a clip seen in an earlier ingest without a full read.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    /// Verified copy already in the current archive, relative to its root.
+    #[serde(default)]
+    pub archived: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Evidence {
     pub sha256: String,
     pub bytes: u64,
@@ -103,7 +109,7 @@ pub struct Evidence {
     pub checks: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Attempt {
     pub id: String,
     pub started_at: String,
@@ -115,7 +121,7 @@ pub struct Attempt {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Item {
     pub source: Candidate,
     pub archive_path: PathBuf,
@@ -138,7 +144,7 @@ impl Item {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Batch {
     pub schema: u32,
     pub id: String,

@@ -1,6 +1,19 @@
 # Implementation and validation status
 
-Implemented on 2026-09-04. This is a working initial application with a desktop executable and an independent headless core. It is **not yet a production-qualified release**: the plan's observed desktop and real NAS release gates are still open.
+First implemented on 2026-09-04; workflow overhaul on 2026-10-25 (below). This is a working application with a desktop executable and an independent headless core. It is **not yet a production-qualified release**: the plan's observed desktop and real NAS release gates are still open.
+
+## 2026-10-25: one-click card workflow
+
+Changed:
+
+- **Desktop rebuilt** around a display-independent state machine (`src/ui/state.rs`, unit-tested) with screens for setup, waiting for a card, scanning, review, running, and done. Card detection and eject use GIO's volume monitor, and cards are recognized by `DCIM` or `PRIVATE/M4ROOT`. Preflight runs in the background as the selection changes (stale results are discarded, and queued checks collapse to the latest), which removes the separate preview step. Other additions: clips grouped by recording day with per-day selection, an estimated finish time, row-level progress, a completion notification, Eject Card, Retry Failed (incomplete items only), drag-and-drop, `resolve-ingest [FOLDER]`, adaptive narrow layouts, and `resolve-ingest demo` driving the real window with synthetic footage.
+- **Archive storage policy:** local disks, external drives, and kernel CIFS/NFS mounts are accepted; GVfs/FUSE is still refused. Removable drives are identified by udisks mount point or filesystem UUID rather than `/dev/sdX`.
+- **Readable layout:** `<recording day>/<camera filename>` with case-insensitive `-N` suffixes shared by sidecars, replacing `DATE/BATCH/originals/<escaped>`. Earlier batches keep their recorded paths. The newest recordings are processed first.
+- **Skipping already-archived clips:** a journal index (schema v3) of verified originals keyed by archive and head/tail fingerprint. Scans leave matches unselected; an unreachable archive does not block a scan.
+- **Verification level:** editing copies get a structure/timing/checksum check by default. The full decode is optional (Preferences, or `--verify full`). The profile string records which ran, and earlier full-decode batches resume unchanged.
+- Hidden filesystem bookkeeping (`.Trashes`, `._*`, `System Volume Information`) is skipped in all scans.
+
+Verified: `make check` passes (fmt, clippy `-D warnings`, 44 tests including 12 UI state tests, a worker-queue test, readable-layout/collision, repeat-ingest skipping, removable-drive identity, and fingerprint tests). In an isolated Xvfb session, the release build ingested a generated three-clip card with an `.SRT` sidecar through the real engine. The results landed at `archive/<day>/<name>` and `editing/<day>/<stem>.mov`, and `.Trashes` was skipped. Re-opening the same card showed "Nothing new on this card". A conversion of a plain folder wrote `clip.MP4.mov` beside each source and skipped `CacheClip`. The first-run setup screen rendered with empty settings. Screenshots of each screen are in [design](../design/). Not yet observed on real hardware: card insertion/eject through udisks on the target desktop, gvfs inside the Flatpak sandbox, and desktop notifications.
 
 ## Implemented
 
@@ -40,9 +53,9 @@ This evidence applies to this one sample and the tested tool version. It does no
 
 ## Desktop evidence and open release gates
 
-The native desktop was launched under Xvfb with a software renderer. The 1,000-row synthetic prototype rendered and responded to controls; the native folder picker opened. Normal and constrained screenshots are in [design](design/). The reduced-width layout wraps status/error text and preserves visible actions. This is a smoke check, not an observed human usability or assistive-technology acceptance test. GTK portal/graphics warnings from the container do not validate native Wayland/portal integration.
+The native desktop was launched under Xvfb with a software renderer. The 1,000-row synthetic prototype rendered and responded to controls; the native folder picker opened. Screenshots from that version have been replaced by the [current ones](../design/). The reduced-width layout wraps status/error text and preserves visible actions. This is a smoke check, not an observed human usability or assistive-technology acceptance test. GTK portal/graphics warnings from the container do not validate native Wayland/portal integration.
 
-A three-clip desktop ingest completed with the new pipeline. [Review](design/pipeline-review.png) shows the temporary-space allowance; [active processing](design/pipeline-active.png) shows simultaneous archive and local-copy progress with the cancel control still visible.
+A three-clip desktop ingest completed with the pipelined workers, showing simultaneous archive and local-copy progress with the cancel control still visible.
 
 The conversion-scan fix was also exercised in an isolated desktop against the user’s Videos folder: it completed within the five-second observation window and displayed 14 footage files, excluding the nested Resolve-generated folders (including 4,670 `.dvcc` cache files). This was a read-only scan; no footage was converted or changed.
 
@@ -54,4 +67,4 @@ Still required before release:
 - Orca walkthrough, native Wayland folder-dialog behavior, observed 100%/150%/200% display and text scaling, reduced motion, focus/status announcements, and a user usability walkthrough. The toolkit decision remains subject to these checks.
 - Longer performance and storage-fault testing of real large batches. The 1,000-row UI and journal tests do not establish throughput for 1,000 real camera clips.
 
-The implementation conservatively rejects non-UTF8 and overlong mapped paths. Moving an unarchived source to a different mount path/identity requires rescanning into a new batch in this version. There is no cross-batch reuse, direct SMB login, automatic card deletion, split-clip joining, or alternate video-transcoding profile. ETA is withheld; stage byte/media-time progress and copy/hash speed are shown.
+The implementation conservatively rejects non-UTF8 and overlong paths. Moving an unarchived source to a different mount path/identity requires rescanning into a new batch. There is no direct SMB login, automatic card deletion, split-clip joining, or alternate video-transcoding profile. The finish-time estimate appears after 10 seconds and 2% of the work, weighted by file size and stage.

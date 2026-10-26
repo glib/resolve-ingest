@@ -1,21 +1,64 @@
-# Desktop toolkit and prototype
+# Desktop toolkit and interface design
 
-Implementation choice: GTK4 0.10 bindings and libadwaita 0.8, targeting GTK 4.12 and libadwaita 1.5. The default desktop has a dark charcoal palette, native controls, a virtualized ColumnView backed by SortListModel, a persistent error banner, native asynchronous folder dialogs, a separate worker thread, and bounded progress events. `cargo run -- demo` is an interactive 1,000-row synthetic slice with location selection, clip details, progress, and error/retry presentation; it does not write media or preferences.
+## Toolkit
 
-The plan named Iced provisionally. The [Iced 0.14 manifest](https://github.com/iced-rs/iced/blob/0.14/Cargo.toml) does not expose an accessibility backend, so it was not a suitable default for this implementation's screen-reader gate. [GTK's accessibility documentation](https://docs.gtk.org/gtk4/section-accessibility.html) describes native accessible roles and properties on its standard controls. This supports selecting GTK for the implementation; it does not substitute for testing this application's accessibility.
+GTK4 (gtk4-rs 0.10) and libadwaita (0.8), targeting GTK 4.12 and libadwaita 1.5 so source builds work on current LTS distributions. The Flatpak uses the GNOME 50 runtime.
 
-Folder selection uses `GtkFileDialog`, accepting only filesystem paths; archive selection additionally requires a kernel CIFS mount. Labels remain selectable and expose full paths in tooltips. Checkboxes carry per-file accessible names. Statuses use words as well as color. The table is virtualized; progress ticks update the footer rather than rebuilding or scrolling the table. State changes update the affected row. Dialogs provide diagnostics copy, archive-only selection, retry, and close-with-active-work decisions.
+The plan named Iced provisionally. The [Iced 0.14 manifest](https://github.com/iced-rs/iced/blob/0.14/Cargo.toml) does not expose an accessibility backend, so it was not a suitable default for this implementation's screen-reader gate. [GTK's accessibility documentation](https://docs.gtk.org/gtk4/section-accessibility.html) describes native accessible roles and properties on its standard controls. That supports choosing GTK; it does not substitute for testing this application's accessibility.
 
-The palette is defined in `src/ui/style.css`. Text scaling and high contrast are available in Settings. Native keyboard focus indicators are reinforced by a blue outline. No animated decoration or estimates without enough information are shown.
+## Architecture
 
-Following UX feedback, all three folder choices and appearance controls live in a dedicated preferences window. The main screen presents one read-only location summary above the ingest controls, rather than mixing configuration buttons into the workflow. Preferences save automatically and location validation feedback stays inside Settings. Custom button borders apply only to application action buttons; native window controls retain their toolkit styling.
+- `ui/state.rs`: the whole interface as data. `Model::update(Msg) -> Vec<Effect>` decides screens, selection, preflight generations, progress, and estimates, with no GTK types, so every screen's behaviour is unit-tested.
+- `ui/mod.rs`: builds the window, renders the model, and performs effects (worker commands, toasts, notifications, dialogs).
+- `ui/worker.rs`: one background thread owns the job journal and runs engine commands in order. Each command gets its own cancel token, and queued preflights collapse to the newest. The window drains replies and pipeline events every 100 ms, which coalesces progress bursts.
+- `ui/clips.rs`: a virtualized `ColumnView` with recording-day sections. Rows carry fixed scan metadata. Progress updates rebind the visible cells of one row in place; they never rebuild the list or move its scroll position.
+- `ui/cards.rs`: card detection and eject through `GVolumeMonitor`.
+- `ui/demo.rs`: a synthetic worker for `resolve-ingest demo`, so the real window can be explored and screenshotted without media.
 
-Updated screenshots: [main location summary](ingest-locations-summary.png) and [Settings window](settings-window.png). A desktop smoke check confirmed native window-control styling and automatic saving of appearance preferences using an isolated configuration directory.
+## Screens
 
-The compact table revision removes the promotional headline, reduces the location panel to three short rows, and uses approximately 33-pixel footage rows at normal text scale. File/date/type/size/duration columns sort without changing underlying selection indices. The recording-date source is explicit in tooltips; modification-time fallback has a `*`. Type/date filters and Select shown only support recent-footage selection. Conversion-only is a separate main-screen workflow, with output placement visible before preview. See the [filtered table](footage-table-filtered.png) and [conversion preview](conversion-preview.png).
+| Screen | Purpose |
+| --- | --- |
+| Setup | First run only: choose the archive and editing folders. Advances once both are set. |
+| Waiting | "Insert a camera card", with Choose Folder… and Convert Existing Files…, plus where files will go. |
+| Scanning | Card name, file count, current file, Cancel. |
+| Review | New clips by day, already-archived ones hidden, location chips, one primary button ("Ingest 16 Files"). Preflight runs in the background; a failure shows its reason and offers Check Again. |
+| Running | Overall progress, estimated finish, one line per active worker, row-level progress, Cancel. |
+| Done | Outcome summary, Eject Card, Retry Failed, Open Editing Folder; a notification if the window is in the background. |
 
-An actual desktop smoke test scanned five fixtures, filtered recent MP4s, reversed the recording-date sort, deselected the older clip, previewed the one remaining file, and converted only that clip beside its original. The journal and filesystem confirmed the selected filename, preserved source, completed conversion, and untouched archive directory.
+![Waiting for a card](waiting.png)
+![Review](review.png)
+![Running](running.png)
+![Done](done.png)
+![Clip details](details.png)
+![Preferences](preferences.png)
+![Nothing new on a re-inserted card](all-caught-up.png)
+![Narrow window](narrow.png)
 
-Calculated sRGB contrast ratios: primary text/background 15.58:1, secondary text/surface 7.86:1, accent/background 7.07:1, control boundary/surface 4.15:1, and warning text/banner 8.45:1. These token checks exceed the plan's text and boundary thresholds; they are not a complete audit of every native control state. A 200% text/high-contrast smoke check kept the activity footer visible and made the main content scrollable. See `prototype-text-200.png`.
+Secondary things live behind the main menu: History, Preferences, Convert Files…, Choose Folder…, Rescan. Each clip opens a details sheet (double-click, Enter, or its chevron) with metadata, destinations, checksums, notes, and per-file actions. Dialogs are `AdwDialog`/`AdwAlertDialog`, which become bottom sheets on narrow windows. Below 700 sp the table keeps name, time, and a shorter status, and the bottom-bar actions stack.
 
-The toolkit choice remains subject to an observed Orca walkthrough, native Wayland/portal folder-dialog testing, 100/150/200% display scaling, 200% text scaling, and constrained-window acceptance on the supported desktop. GTK's default accessibility support is not evidence that those gates have passed. Screenshot evidence and remaining issues are recorded in the implementation status.
+Keyboard shortcuts: Ctrl+Return starts, Ctrl+O chooses a folder, Ctrl+R or F5 rescans, Ctrl+H opens History, Ctrl+, opens Preferences, Ctrl+W/Ctrl+Q closes (asking first while work is running).
+
+## Visual system
+
+The charcoal palette from the plan is kept as libadwaita colour overrides in `src/ui/style.css`; otherwise the app uses libadwaita's own style classes (`boxed-list`, `pill`, `suggested-action`, `title-2`, `dim-label`, `numeric`). Statuses pair words with icons and colour. Calculated sRGB contrast ratios for the current tokens:
+
+| Pair | Ratio |
+| --- | --- |
+| Text on window `#EDF0F5`/`#15181D` | 15.58:1 |
+| Text on table `#EDF0F5`/`#1A1E24` | 14.65:1 |
+| Dimmed text (55%) on table | 5.35:1 |
+| Accent text `#8FB2FF` on table | 7.95:1 |
+| Success / warning / error text on table | 10.76 / 10.76 / 9.22:1 |
+| Suggested button label on accent | 7.07:1 |
+
+These token checks exceed the plan's 4.5:1 text threshold; they are not an audit of every native control state. High contrast and 150%/200% text are in Preferences.
+
+## Known GTK behaviour worked around
+
+- After rows are replaced, `ColumnView` re-anchors on the first *row*, which leaves its day header scrolled away. The list pins itself to the top through the first layout after a rebuild.
+- Re-showing a hidden column (for the narrow layout) adds that column's cells to section-header widgets as well. Header widgets are recreated after each breakpoint change.
+
+## Open acceptance
+
+The toolkit choice remains subject to an observed Orca walkthrough, native Wayland/portal folder-dialog testing, 100/150/200% display scaling, and a user walkthrough on the supported desktop. The screenshots come from an isolated Xvfb session with a software renderer; see [validation status](../validation/status.md).

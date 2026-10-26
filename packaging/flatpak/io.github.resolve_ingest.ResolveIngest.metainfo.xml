@@ -14,13 +14,15 @@
   </categories>
   <description>
     <p>
-      Resolve Ingest securely archives camera media, checks the copied bytes,
-      and creates DaVinci Resolve editing copies with unchanged video and
-      24-bit PCM audio.
+      Insert a camera card and Resolve Ingest selects the clips that are not
+      archived yet. One click copies the originals to your archive, checks
+      every byte, and creates DaVinci Resolve editing copies with unchanged
+      video and 24-bit PCM audio.
     </p>
     <p>
-      It supports existing local footage as well as originals from an
-      OS-mounted CIFS share, and keeps a local journal for recovery and retry.
+      Archives can be on a local disk, an external drive, or a network share.
+      Existing footage can also be converted in place. A local journal
+      supports recovery and retry.
     </p>
   </description>
   <content_rating type="oars-1.1"/>

@@ -1,5 +1,7 @@
 # Resolve Ingest project plan
 
+> **Revisions (2026-10-25).** After using the first implementation, these decisions changed in favour of a one-click card workflow: archives may be on any kernel-mounted local, removable, CIFS, or NFS filesystem (GVfs/FUSE is still refused); originals use a readable `<recording day>/<filename>` layout, and clips already verified in the archive are skipped on later ingests; the full decode of editing copies is optional, with structure/timing/checksum checks by default; cards are detected automatically and preflight runs in the background, without a separate preview step. See [validation status](validation/status.md) and [storage](storage.md). The rest of this document is the original plan.
+
 ## Scope and defaults
 
 Build a Linux-first Rust GUI for a repeatable SD-card ingest workflow. Remember three independent folder selections: source card, editing output, and original archive on a mounted Samba/CIFS share. The editing destination may also be on a share. Selecting a remembered path never starts an ingest automatically.

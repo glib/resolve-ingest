@@ -3,9 +3,10 @@ use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use rusqlite::{Connection, params};
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     os::fd::{AsRawFd, RawFd},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 pub struct Jobs {
@@ -17,8 +18,7 @@ impl Jobs {
         fs::create_dir_all(dir)?;
         let mount = mount_for(&fs::canonicalize(dir)?)?;
         ensure!(
-            !matches!(mount.fs_type.as_str(), "cifs" | "smb3" | "nfs" | "nfs4")
-                && !mount.fs_type.starts_with("fuse"),
+            !mount.is_network() && !mount.fs_type.starts_with("fuse"),
             "Job journal must be on local storage. Set XDG_DATA_HOME to a local directory."
         );
         let lock = OpenOptions::new()
@@ -30,9 +30,11 @@ impl Jobs {
         lock.try_lock_exclusive().context("Another Resolve Ingest instance or supervised worker is active. Wait for it to stop before retrying.")?;
         let mut db = Connection::open(dir.join("jobs.sqlite3"))?;
         let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(version <= 2, "Unsupported job database version");
+        ensure!(version <= 3, "Unsupported job database version");
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS batches (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, status TEXT NOT NULL, manifest TEXT NOT NULL); CREATE TABLE IF NOT EXISTS transitions (seq INTEGER PRIMARY KEY, batch_id TEXT NOT NULL, recorded_at TEXT NOT NULL, manifest TEXT NOT NULL);")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS batch_items (batch_id TEXT NOT NULL, position INTEGER NOT NULL, manifest TEXT NOT NULL, PRIMARY KEY(batch_id, position));")?;
+        // Verified originals by archive folder and source fingerprint, for skipping repeat ingests.
+        db.execute_batch("CREATE TABLE IF NOT EXISTS archived (archive TEXT NOT NULL, fingerprint TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, bytes INTEGER NOT NULL, batch_id TEXT NOT NULL, PRIMARY KEY(archive, fingerprint));")?;
         if version < 2 {
             let old: Vec<String> = db
                 .prepare("SELECT manifest FROM batches")?
@@ -55,6 +57,9 @@ impl Jobs {
             }
             tx.pragma_update(None, "user_version", 2)?;
             tx.commit()?;
+        }
+        if version < 3 {
+            db.pragma_update(None, "user_version", 3)?;
         }
         let mut jobs = Self { db, lock };
         for mut batch in jobs
@@ -103,6 +108,30 @@ impl Jobs {
         for index in indices {
             let item = serde_json::to_string(&batch.items[index])?;
             let changed = tx.execute("INSERT INTO batch_items VALUES (?1, ?2, ?3) ON CONFLICT(batch_id, position) DO UPDATE SET manifest=excluded.manifest WHERE batch_items.manifest != excluded.manifest", params![batch.id, index as i64, item])?;
+            let entry = &batch.items[index];
+            if let (
+                Some(archive),
+                Some(fingerprint),
+                Some(evidence),
+                crate::model::Stage::Verified,
+            ) = (
+                &batch.settings.archive,
+                &entry.source.fingerprint,
+                &entry.archive_evidence,
+                &entry.archive,
+            ) {
+                tx.execute(
+                    "INSERT OR REPLACE INTO archived VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        archive_key(&archive.path),
+                        fingerprint,
+                        entry.archive_path.to_string_lossy(),
+                        evidence.sha256,
+                        evidence.bytes as i64,
+                        batch.id
+                    ],
+                )?;
+            }
             if changed > 0 {
                 let audit = serde_json::json!({"position": index, "item": &batch.items[index]});
                 tx.execute(
@@ -135,6 +164,22 @@ impl Jobs {
             .collect::<Result<_>>()?;
         Ok(batch)
     }
+    /// Archive-relative paths of verified originals in `archive`, keyed by source fingerprint.
+    pub fn archived(&self, archive: &Path) -> Result<HashMap<String, (PathBuf, u64)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT fingerprint, path, bytes FROM archived WHERE archive=?1")?;
+        let rows = stmt.query_map([archive_key(archive)], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (
+                    PathBuf::from(r.get::<_, String>(1)?),
+                    r.get::<_, i64>(2)? as u64,
+                ),
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
     pub fn history(&self) -> Result<Vec<Batch>> {
         let mut stmt = self
             .db
@@ -142,6 +187,9 @@ impl Jobs {
         let records = stmt.query_map([], |r| r.get::<_, String>(0))?;
         records.map(|r| self.load(&r?)).collect()
     }
+}
+fn archive_key(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 fn batch_header(b: &Batch) -> Batch {
     Batch {

@@ -13,28 +13,17 @@ fn events() -> Events {
     tx
 }
 #[test]
-fn safe_names_are_casefold_distinct_and_keep_extensions() {
-    let names = [
-        "DCIM/Clip.MP4",
-        "DCIM/clip.mp4",
-        "DCIM/clip.mov",
-        "DCIM/clip",
-        "DCIM/clip./x",
-        "DCIM/é:?.mp4",
-        "DCIM/~41",
-    ];
-    let mapped: std::collections::HashSet<_> = names
-        .iter()
-        .map(|n| {
-            storage::safe_relative(Path::new(n))
-                .unwrap()
-                .to_string_lossy()
-                .to_lowercase()
-        })
-        .collect();
-    assert_eq!(mapped.len(), names.len());
-    assert!(storage::safe_relative(Path::new("../escape")).is_err());
-    assert!(storage::safe_relative(Path::new(&"A".repeat(100))).is_err());
+fn portable_names_stay_readable_and_reject_unusable_names() {
+    use std::ffi::OsStr;
+    let name = |n: &str| storage::portable_name(OsStr::new(n));
+    assert_eq!(
+        name("DJI_20260826184226_0027_D.MP4").unwrap(),
+        "DJI_20260826184226_0027_D.MP4"
+    );
+    assert_eq!(name("é:?.mp4").unwrap(), "é__.mp4");
+    assert_eq!(name("trailing. ").unwrap(), "trailing");
+    assert!(name("..").is_err());
+    assert!(name(&"A".repeat(300)).is_err());
 }
 #[test]
 fn mount_parser_decodes_paths_without_retaining_credentials() {
@@ -43,6 +32,16 @@ fn mount_parser_decodes_paths_without_retaining_credentials() {
     );
     assert_eq!(mounts[0].point, Path::new("/mnt/My NAS"));
     assert_eq!(mounts[0].stable(), "cifs|//nas/video|/");
+    assert_eq!(mounts[0].durable_id(), mounts[0].stable());
+    // A removable drive is known by its udisks mount point, not its /dev/sdX name.
+    let usb = |dev: &str| {
+        storage::parse_mounts(&format!(
+            "40 1 8:17 / /run/media/me/FOOTAGE rw - exfat {dev} rw\n"
+        ))
+        .remove(0)
+    };
+    assert_eq!(usb("/dev/sdb1").durable_id(), usb("/dev/sdc1").durable_id());
+    assert!(usb("/dev/sdc1").matches(&usb("/dev/sdb1").durable_id()));
 }
 #[test]
 fn no_clobber_and_symlink_escape_are_rejected() {
@@ -147,6 +146,7 @@ fn archive_only_is_not_an_editing_success() {
             selected: true,
             editing: false,
             sidecar_for: None,
+            ..Default::default()
         },
         archive_path: "sidecar.srt".into(),
         editing_path: None,
@@ -186,8 +186,8 @@ impl Fixture {
         }
         let settings = Settings {
             source: dir.path().join("source"),
-            archive: Some(Destination::select(dir.path().join("archive"), false).unwrap()),
-            editing: Some(Destination::select(dir.path().join("editing"), false).unwrap()),
+            archive: Some(Destination::select(dir.path().join("archive")).unwrap()),
+            editing: Some(Destination::select(dir.path().join("editing")).unwrap()),
             ..Default::default()
         };
         Self { dir, settings }
@@ -201,6 +201,7 @@ impl Fixture {
             selected: true,
             editing: false,
             sidecar_for: None,
+            ..Default::default()
         }
     }
 }
@@ -416,4 +417,123 @@ fn camera_data_streams_can_omit_codec_name() {
     .unwrap();
     assert_eq!(probe.streams[0].codec_name, "unknown");
     assert_eq!(probe.notices().len(), 2);
+}
+
+#[tokio::test]
+async fn archive_layout_is_readable_by_day_and_suffixes_clashes_with_their_sidecars() {
+    let f = Fixture::new();
+    for dir in ["DCIM/A", "DCIM/B"] {
+        fs::create_dir_all(f.settings.source.join(dir)).unwrap();
+    }
+    // One shared recording time: same day folder, and planning order falls back to the path.
+    let shot = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+    for name in ["DCIM/A/GX01.MP4", "DCIM/B/gx01.mp4", "DCIM/B/gx01.LRF"] {
+        let path = f.settings.source.join(name);
+        fs::write(&path, name).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(shot)
+            .unwrap();
+    }
+    let mut sidecar = f.candidate("DCIM/B/gx01.LRF");
+    sidecar.sidecar_for = Some("DCIM/B/gx01.mp4".into());
+    let candidates = vec![
+        f.candidate("DCIM/A/GX01.MP4"),
+        sidecar,
+        f.candidate("DCIM/B/gx01.mp4"),
+    ];
+    let day = resolve_ingest::catalog::recorded_day(&candidates[0]).to_string();
+    // An unrelated file already holds the second clip's preferred name.
+    fs::create_dir_all(f.dir.path().join("archive").join(&day)).unwrap();
+    fs::write(
+        f.dir.path().join("archive").join(&day).join("gx01-2.mp4"),
+        b"other",
+    )
+    .unwrap();
+    let b = resolve_ingest::pipeline::plan(f.settings.clone(), candidates, &Cancel::default())
+        .await
+        .unwrap();
+    let mut paths: Vec<_> = b
+        .items
+        .iter()
+        .map(|i| i.archive_path.to_string_lossy().into_owned())
+        .collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            format!("{day}/GX01.MP4"),
+            format!("{day}/gx01-3.LRF"),
+            format!("{day}/gx01-3.mp4"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn repeat_ingest_skips_clips_already_verified_in_the_archive() {
+    let f = Fixture::new();
+    fs::write(f.settings.source.join("clip.mp4"), b"camera bytes").unwrap();
+    fs::write(f.settings.source.join("new.mp4"), b"new camera bytes").unwrap();
+    let cancel = Cancel::default();
+    let mut jobs = Jobs::open(&f.dir.path().join("jobs")).unwrap();
+    let archive = f.settings.archive.clone().unwrap();
+    let mut first = resolve_ingest::discovery::scan(&f.settings.source, &cancel)
+        .await
+        .unwrap();
+    first.retain(|c| c.relative == Path::new("clip.mp4"));
+    let mut b = resolve_ingest::pipeline::plan(f.settings.clone(), first, &cancel)
+        .await
+        .unwrap();
+    resolve_ingest::pipeline::run(&mut jobs, &mut b, None, &cancel, &events())
+        .await
+        .unwrap();
+    assert_eq!(b.status, "Completed");
+
+    let mut again = resolve_ingest::discovery::scan(&f.settings.source, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolve_ingest::pipeline::mark_archived(&jobs, &archive, &mut again).unwrap(),
+        1
+    );
+    let clip = again
+        .iter()
+        .find(|c| c.relative == Path::new("clip.mp4"))
+        .unwrap();
+    assert!(!clip.selected);
+    assert_eq!(clip.archived.as_ref(), Some(&b.items[0].archive_path));
+    assert!(
+        again
+            .iter()
+            .find(|c| c.relative == Path::new("new.mp4"))
+            .unwrap()
+            .selected
+    );
+
+    // A recorded copy that is no longer in the archive does not count.
+    fs::remove_file(archive.path.join(&b.items[0].archive_path)).unwrap();
+    let mut rescanned = resolve_ingest::discovery::scan(&f.settings.source, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolve_ingest::pipeline::mark_archived(&jobs, &archive, &mut rescanned).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn verification_profiles_round_trip_including_earlier_full_decode_batches() {
+    use resolve_ingest::{media, settings::Verify};
+    for v in [Verify::Fast, Verify::Full] {
+        assert_eq!(media::verify_for_profile(media::profile(v)), Some(v));
+    }
+    assert_eq!(
+        media::verify_for_profile(
+            "primary-motion-video-copy/all-audio-pcm_s24le/mov/full-decode/v1"
+        ),
+        Some(Verify::Full)
+    );
+    assert_eq!(media::verify_for_profile("unknown"), None);
 }

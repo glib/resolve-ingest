@@ -2,7 +2,7 @@
 Type=Application
 Name=Resolve Ingest
 Comment=Archive camera originals and prepare verified PCM editing copies
-Exec=resolve-ingest
+Exec=resolve-ingest %f
 Icon=io.github.resolve_ingest.ResolveIngest
 Terminal=false
 Categories=AudioVideo;

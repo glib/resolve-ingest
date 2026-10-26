@@ -14,35 +14,35 @@ pub struct Destination {
     pub shared: bool,
 }
 impl Destination {
-    pub fn select(path: PathBuf, require_cifs: bool) -> Result<Self> {
+    /// Accepts local disks, removable drives, and kernel-mounted CIFS/NFS shares. The mount's
+    /// identity is remembered so an absent drive or share can never become a local folder.
+    pub fn select(path: PathBuf) -> Result<Self> {
         let path = fs::canonicalize(path)
             .context("Location unavailable. Select the current mounted folder.")?;
         let mount = crate::storage::mount_for(&path)?;
         ensure!(
-            !matches!(
-                mount.fs_type.as_str(),
-                "nfs" | "nfs4" | "9p" | "ceph" | "afs"
-            ),
-            "This network filesystem is unsupported. Select local storage or an OS-mounted CIFS share."
+            !matches!(mount.fs_type.as_str(), "9p" | "ceph" | "afs"),
+            "This network filesystem is unsupported. Select local storage or a CIFS/NFS share mounted by the operating system."
         );
         ensure!(
             !mount.fs_type.starts_with("fuse"),
-            "GVfs/FUSE is unsupported. Select an OS-mounted CIFS folder."
-        );
-        let shared = mount.fs_type == "cifs" || mount.fs_type == "smb3";
-        ensure!(
-            !require_cifs || shared,
-            "Archive must be on an OS-mounted CIFS share. Mount the share first, then select its folder."
+            "GVfs/FUSE locations are unsupported. Mount the drive or share through the operating system, then select its folder."
         );
         Ok(Self {
             path,
-            expected_mount: mount.stable(),
-            shared,
+            expected_mount: mount.durable_id(),
+            shared: mount.is_network(),
         })
+    }
+    pub fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.path.display().to_string())
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub version: u32,
@@ -52,6 +52,16 @@ pub struct Settings {
     pub high_contrast: bool,
     pub text_scale: f64,
     pub workflow: Workflow,
+    pub verify: Verify,
+}
+/// How editing copies are checked. Originals always get a full SHA-256 readback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Verify {
+    /// Stream structure, formats, timing, and a recorded checksum.
+    #[default]
+    Fast,
+    /// Also decodes every audio and video frame of the editing copy.
+    Full,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Workflow {
@@ -69,6 +79,7 @@ impl Default for Settings {
             high_contrast: false,
             text_scale: 1.0,
             workflow: Workflow::Ingest,
+            verify: Verify::Fast,
         }
     }
 }

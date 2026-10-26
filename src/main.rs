@@ -5,15 +5,36 @@ use resolve_ingest::{
     jobs::Jobs,
     model::Cancel,
     pipeline,
-    settings::{self, Destination, Settings},
+    settings::{self, Destination, Settings, Verify},
 };
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about, args_conflicts_with_subcommands = true)]
 struct Cli {
+    /// Open the desktop app on a card (to ingest) or any other folder (to convert).
+    folder: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Action>,
+}
+#[derive(clap::Args)]
+struct IngestOptions {
+    /// Preserve every regular file without requesting editing copies.
+    #[arg(long)]
+    archive_only: bool,
+    /// Also copy clips whose verified original is already in the archive.
+    #[arg(long)]
+    include_archived: bool,
+    /// How editing copies are checked; originals always get a full checksum readback.
+    #[arg(long, value_enum, default_value_t = VerifyArg::Fast)]
+    verify: VerifyArg,
+}
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum VerifyArg {
+    /// Stream structure, formats, timing, and checksum.
+    Fast,
+    /// Also decode every audio and video frame.
+    Full,
 }
 #[derive(Subcommand)]
 enum Action {
@@ -22,20 +43,16 @@ enum Action {
         source: PathBuf,
         archive: PathBuf,
         editing: PathBuf,
-        #[arg(long)]
-        archive_only: bool,
-        #[arg(long, help = "Explicitly allow local archives for testing")]
-        allow_local_archive: bool,
+        #[command(flatten)]
+        options: IngestOptions,
     },
     /// Start a new verified batch (originals are never removed).
     Ingest {
         source: PathBuf,
         archive: PathBuf,
         editing: PathBuf,
-        #[arg(long)]
-        archive_only: bool,
-        #[arg(long)]
-        allow_local_archive: bool,
+        #[command(flatten)]
+        options: IngestOptions,
     },
     /// Revalidate and resume a previous batch; card is unnecessary for verified archives.
     Retry {
@@ -64,7 +81,8 @@ fn main() -> Result<()> {
     if cli.command.is_none() || matches!(cli.command, Some(Action::Demo)) {
         #[cfg(feature = "desktop")]
         {
-            resolve_ingest::ui::run(matches!(cli.command, Some(Action::Demo)));
+            let folder = cli.folder.map(std::fs::canonicalize).transpose()?;
+            resolve_ingest::ui::run(matches!(cli.command, Some(Action::Demo)), folder);
             return Ok(());
         }
         #[cfg(not(feature = "desktop"))]
@@ -94,28 +112,43 @@ async fn headless(action: Action) -> Result<()> {
             source,
             archive,
             editing,
-            archive_only,
-            allow_local_archive,
+            options,
         }
         | Action::Ingest {
             source,
             archive,
             editing,
-            archive_only,
-            allow_local_archive,
+            options,
         } => {
             let is_plan = std::env::args().nth(1).as_deref() == Some("plan");
             let settings = Settings {
                 source: std::fs::canonicalize(source).context("Source unavailable")?,
-                archive: Some(Destination::select(archive, !allow_local_archive)?),
-                editing: Some(Destination::select(editing, false)?),
+                archive: Some(Destination::select(archive)?),
+                editing: Some(Destination::select(editing)?),
+                verify: match options.verify {
+                    VerifyArg::Fast => Verify::Fast,
+                    VerifyArg::Full => Verify::Full,
+                },
                 ..Default::default()
             };
             let mut candidates = discovery::scan(&settings.source, &cancel).await?;
-            if archive_only {
+            if options.archive_only {
                 for c in &mut candidates {
                     c.selected = true;
                     c.editing = false;
+                }
+            }
+            if !options.include_archived {
+                let archive = settings.archive.as_ref().unwrap();
+                let skipped = pipeline::mark_archived(&jobs, archive, &mut candidates)?;
+                if skipped > 0 {
+                    eprintln!(
+                        "Skipping {skipped} files already verified in this archive (--include-archived copies them again)"
+                    );
+                }
+                if !candidates.iter().any(|c| c.selected) {
+                    println!("Nothing new to ingest.");
+                    return Ok(());
                 }
             }
             let mut batch = pipeline::plan(settings, candidates, &cancel).await?;

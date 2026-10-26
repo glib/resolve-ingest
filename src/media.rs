@@ -14,7 +14,24 @@ use tokio::{
     process::Command,
 };
 
-pub const PROFILE: &str = "primary-motion-video-copy/all-audio-pcm_s24le/mov/full-decode/v1";
+use crate::settings::Verify;
+
+const FULL_PROFILE: &str = "primary-motion-video-copy/all-audio-pcm_s24le/mov/full-decode/v1";
+const FAST_PROFILE: &str =
+    "primary-motion-video-copy/all-audio-pcm_s24le/mov/structure-checksum/v1";
+
+pub fn profile(verify: Verify) -> &'static str {
+    match verify {
+        Verify::Fast => FAST_PROFILE,
+        Verify::Full => FULL_PROFILE,
+    }
+}
+/// The verification level a recorded batch was planned with, if this version supports it.
+pub fn verify_for_profile(profile: &str) -> Option<Verify> {
+    [Verify::Fast, Verify::Full]
+        .into_iter()
+        .find(|v| self::profile(*v) == profile)
+}
 
 /// Locate the media tools shipped with an installation before consulting PATH.
 /// `RESOLVE_INGEST_FFMPEG_DIR` is useful for portable installs and development.
@@ -80,7 +97,7 @@ mod tests {
             .unwrap();
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Stream {
     pub index: u32,
     pub codec_type: String,
@@ -106,7 +123,7 @@ pub struct Stream {
     pub color_transfer: Option<String>,
     pub color_primaries: Option<String>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Probe {
     pub streams: Vec<Stream>,
     #[serde(default)]

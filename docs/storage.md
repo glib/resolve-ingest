@@ -1,14 +1,14 @@
 # Supported storage and recovery
 
-The operating system mounts and authenticates the NAS. Use an actual kernel CIFS mount, for example a mount maintained through your distribution's system settings or `/etc/fstab`. Keep any credentials file outside this application, readable only by its owner. Use `findmnt -T /mnt/nas/archive` to check that the location is on `cifs` or `smb3` before selecting it. Desktop `smb://` locations, GVfs/FUSE, and NFS are outside this storage profile.
+The archive and editing folders can be on a local disk, an external drive, or a network share that the operating system has mounted (kernel CIFS/SMB3 or NFS, for example through system settings or `/etc/fstab`). Keep any credentials file outside this application. Desktop `smb://` locations and other GVfs/FUSE paths are refused, because they cannot satisfy the publication and identity checks below. `findmnt -T /path/to/folder` shows what a folder is mounted on.
 
-Choose existing, independent source, original-archive, and editing roots. The archive must be CIFS in the desktop; the editing root can be local or CIFS. The application remembers filesystem type, share source, and mount root separately from the path. It does not retain mount options. If a share is unmounted, its local fallback directory will not match the remembered identity and ingest is blocked. A legitimate remount is accepted on manual retry after reopening and validating the roots.
+Each destination is remembered with the identity of the filesystem that holds it: the udisks mount point for removable drives (stable across `/dev/sdX` renumbering), otherwise the filesystem UUID where visible, otherwise the filesystem type, mount source, and mount root. Mount options are never stored. If a drive is unplugged or a share unmounted, the empty folder left behind does not match the remembered identity, and work is blocked instead of being written to local storage. A legitimate remount is accepted on retry after the roots are reopened and validated. The job journal itself must be on local storage.
 
 ## Permission denied during review
 
 Review checks each destination by creating, syncing, renaming, and deleting small temporary files before copying any media. A folder can be browsable while these writes are denied. The error identifies the archive or editing destination that failed.
 
-For CIFS, check both the local mount permissions and the NAS account's permissions on the selected folder. A mount presenting UID/GID 0 and directory mode `0755` allows only its owner to create files. Configure ownership for the desktop user's UID/GID in the host's CIFS mount configuration, retaining the existing authentication settings, and remount through the operating system. The NAS account must also be allowed to create, rename, and delete files. For a local editing destination, select a folder writable by the desktop user. Retry Review ingest after correcting access.
+For CIFS, check both the local mount permissions and the NAS account's permissions on the selected folder. A mount presenting UID/GID 0 and directory mode `0755` allows only its owner to create files. Configure ownership for the desktop user's UID/GID in the host's CIFS mount configuration, retaining the existing authentication settings, and remount through the operating system. The NAS account must also be allowed to create, rename, and delete files. For a local editing destination, select a folder writable by the desktop user. After correcting access, choose **Check Again**.
 
 The Linux implementation traverses directory descriptors with `openat`, `O_DIRECTORY`, and `O_NOFOLLOW`. Descents and source files must remain on the selected mount (including mount-ID checks for bind aliases). Conversion receives inherited, already-open file descriptors through `/proc/self/fd`; FFmpeg never opens a user-supplied output pathname. Files are created exclusively. Publication uses `renameat2(RENAME_NOREPLACE)` and checks file sync and directory sync. Preflight exercises successful publication and rejection of an existing target. Unsupported directory sync is recorded explicitly.
 
@@ -26,14 +26,22 @@ The two-asset limit bounds active work. Partials retained from failed attempts c
 
 ## Output paths
 
-Each batch gets a UTC date and UUID. Source hierarchy is preserved under `DATE/UUID/originals` and `DATE/UUID/clips`. Components use reversible ASCII escaping: `f-` prefix, lowercase ASCII letters/digits/hyphen/underscore unchanged, every other UTF-8 byte encoded as `~hh`. Uppercase is escaped so case-folding destinations cannot collapse distinct source names. The editing name retains the encoded original extension and appends `.mov`, so `clip.mp4` and `clip.mov` stay separate. The manifest maps original names to planned names. Overlong and non-UTF8 paths fail preflight with an explanation. Files are never silently renamed to an ambiguous destination name.
+Originals go to `ARCHIVE/<recording day>/<camera filename>` and editing copies to `EDITING/<recording day>/<stem>.mov`; sidecars share their clip's day folder. The recording day comes from the filename timestamp, then embedded creation time, then file modification time. Names are kept readable. Characters that SMB or exFAT reject (`<>:"/\|?*` and control characters) become `_`, and trailing dots and spaces are dropped. Names are compared case-insensitively against files already in the folder and against the rest of the batch. A clash gets `-2`, `-3`, and so on, and a clip and its sidecars share the same suffix. Non-UTF8 or overlong names fail preflight with an explanation. Within a batch, the newest recordings are processed first.
+
+Conversion-only batches keep the source's relative folder and append `.mov` to the full filename (`clip.mp4.mov`), so `clip.mp4` and `clip.mov` stay distinct beside their sources.
+
+Batches from earlier versions keep the layout they were planned with (`DATE/BATCH/originals/…` with escaped names), so their retries still work.
 
 ## Recovery
 
 The local SQLite journal snapshots settings, paths, expected hashes, verification checks, stage transitions, and attempts. Expected evidence is committed before publication. A crash after rename and before the state update can therefore be reconciled by checking the published file against that evidence. Existing files without matching evidence are conflicts, never implicit duplicates.
 
-Retry rehashes any reusable archive. Existing editing results also undergo structural validation, full-stream decode, and comparison with the recorded SHA-256. A conversion can restart from a verified archive without the card. A source missing before archival must be reconnected at its recorded path; if the card's identity or mount path changed, rescan and start a new batch in this version.
+Retry rehashes any reusable archive. Existing editing results also undergo structural validation (plus a full decode when the batch was planned with the thorough check) and comparison with the recorded SHA-256. Retry Failed in the app re-runs only incomplete items; verified ones are not rechecked. A conversion can restart from a verified archive without the card. A source missing before archival must be reconnected at its recorded path; if the card's identity or mount path changed, rescan and start a new batch in this version.
 
 Interrupted attempts restart with new, exclusively owned partial names. The journal retains earlier diagnostics. Only paths explicitly recorded as attempt partials can be cleaned up, and cleanup holds the application lock. FFmpeg inherits that lock and receives a parent-death signal: recovery cannot race an orphan that is still exiting. Cancellation sends SIGTERM, then escalates after two seconds if necessary, and waits for exit.
 
-New batches always create new archive/output sets. There is no cross-batch deduplication. Report files are explicitly exported and never overwrite an existing report.
+## Already-archived clips
+
+Every verified original is indexed in the journal by archive folder and a source fingerprint: file size plus SHA-256 of the first and last MiB. Computing it reads at most 2 MiB per file, so a whole card can be compared with earlier ingests quickly. When a card is scanned, clips whose fingerprint matches a verified original that is still present at its recorded size are marked **Already archived** and left unselected. Selecting one anyway archives a second copy under a `-2` name. If the archive is unreachable during a scan, the card is still shown with everything selected, and preflight reports the archive problem. The fingerprint decides only what to preselect; every copy still gets a full SHA-256 and readback.
+
+Report files are explicitly exported and never overwrite an existing report.

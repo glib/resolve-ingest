@@ -22,9 +22,49 @@ pub struct Mount {
     pub source: String,
 }
 impl Mount {
+    /// Mount source as the kernel reports it. Cheap; used to detect remounts during work.
     pub fn stable(&self) -> String {
         format!("{}|{}|{}", self.fs_type, self.source, self.root.display())
     }
+    /// Survives `/dev/sdX` renumbering of removable drives. udisks names their mount points
+    /// after the volume label or UUID, which also works inside a sandbox without `/dev/disk`.
+    pub fn durable_id(&self) -> String {
+        if self.source.starts_with("/dev/")
+            && (self.point.starts_with("/run/media") || self.point.starts_with("/media"))
+        {
+            return format!(
+                "{}|mount={}|{}",
+                self.fs_type,
+                self.point.display(),
+                self.root.display()
+            );
+        }
+        match block_uuid(&self.source) {
+            Some(uuid) => format!("{}|uuid={uuid}|{}", self.fs_type, self.root.display()),
+            None => self.stable(),
+        }
+    }
+    /// Accepts identities recorded before UUIDs were used.
+    pub fn matches(&self, expected: &str) -> bool {
+        expected == self.stable() || expected == self.durable_id()
+    }
+    pub fn is_network(&self) -> bool {
+        is_network_fs(&self.fs_type)
+    }
+}
+pub fn is_network_fs(fs_type: &str) -> bool {
+    matches!(fs_type, "cifs" | "smb3" | "nfs" | "nfs4")
+}
+fn block_uuid(source: &str) -> Option<String> {
+    if !source.starts_with("/dev/") {
+        return None;
+    }
+    let device = fs::canonicalize(source).ok()?;
+    fs::read_dir("/dev/disk/by-uuid")
+        .ok()?
+        .flatten()
+        .find(|e| fs::canonicalize(e.path()).is_ok_and(|p| p == device))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
 }
 fn unescape(s: &str) -> String {
     s.replace("\\040", " ")
@@ -99,7 +139,6 @@ pub struct Root {
     pub dir: File,
     mount: Mount,
     identity: (u64, u64),
-    expected: Option<Destination>,
 }
 impl Root {
     pub fn source(path: &Path) -> Result<Self> {
@@ -112,16 +151,16 @@ impl Root {
         let mount = mount_for(path)?;
         if let Some(d) = &expected {
             ensure!(
-                mount.stable() == d.expected_mount,
-                "Destination unavailable or share changed. Reconnect the expected share, then retry."
+                mount.matches(&d.expected_mount),
+                "Destination unavailable or share changed. Reconnect the expected drive or share, then retry."
             );
             ensure!(
                 !mount.fs_type.starts_with("fuse"),
-                "Unsupported FUSE destination; use an OS-mounted CIFS share."
+                "Unsupported FUSE destination; mount the share through the operating system."
             );
             ensure!(
-                !d.shared || matches!(mount.fs_type.as_str(), "cifs" | "smb3"),
-                "Expected CIFS mount is absent. Reconnect the share."
+                !d.shared || mount.is_network(),
+                "Expected network share is absent. Reconnect the share."
             );
         }
         let dir = absolute_dir(path).context(
@@ -133,7 +172,6 @@ impl Root {
             dir,
             mount,
             identity: (m.dev(), m.ino()),
-            expected,
         };
         r.validate()?;
         Ok(r)
@@ -144,12 +182,6 @@ impl Root {
             current.id == self.mount.id && current.stable() == self.mount.stable(),
             "Destination mount changed during work. Reconnect the expected share and retry."
         );
-        if let Some(d) = &self.expected {
-            ensure!(
-                d.expected_mount == current.stable(),
-                "Expected share is unavailable"
-            );
-        }
         let m = absolute_dir(&self.path)?.metadata()?;
         ensure!(
             (m.dev(), m.ino()) == self.identity,
@@ -329,7 +361,7 @@ impl Root {
     }
     pub fn same_filesystem(&self, other: &Self) -> bool {
         self.device() == other.device()
-            || (matches!(self.mount.fs_type.as_str(), "cifs" | "smb3")
+            || (self.mount.is_network()
                 && self.mount.fs_type == other.mount.fs_type
                 && self.mount.source == other.mount.source)
     }
@@ -371,32 +403,30 @@ pub fn reject_overlap(paths: &[&Path]) -> Result<()> {
     Ok(())
 }
 
-/// ASCII encoding is reversible and case-fold safe, even for non-UTF8 names. Uppercase is escaped.
-pub fn safe_relative(path: &Path) -> Result<PathBuf> {
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        let Component::Normal(n) = c else {
-            bail!("Unsafe source path");
-        };
-        let mut s = String::from("f-");
-        for b in n.as_bytes() {
-            if b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_') {
-                s.push(*b as char);
-            } else {
-                s.push_str(&format!("~{b:02x}"));
-            }
-        }
-        ensure!(
-            s.len() <= 220,
-            "Filename too long after safe mapping: {}. Rename a copy of this source before ingest.",
-            path.display()
-        );
-        out.push(s);
+/// Keeps camera filenames readable while avoiding characters SMB/exFAT destinations reject.
+/// Uniqueness is the planner's job: it compares names case-insensitively.
+pub fn portable_name(name: &OsStr) -> Result<String> {
+    let name = name
+        .to_str()
+        .with_context(|| format!("Non-UTF8 filename {name:?}. Rename a copy before ingest."))?;
+    let mut out: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    while out.ends_with(['.', ' ']) {
+        out.pop();
     }
     ensure!(
-        out.as_os_str().len() <= 3000,
-        "Mapped path is too long: {}",
-        path.display()
+        !out.is_empty() && out != "." && out != "..",
+        "Unusable filename {name:?}"
+    );
+    ensure!(
+        out.len() <= 240,
+        "Filename too long: {name}. Rename a copy of this source before ingest."
     );
     Ok(out)
 }

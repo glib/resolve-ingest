@@ -1,1585 +1,1300 @@
-mod table;
+//! GTK4/libadwaita desktop. `state` decides; this module draws the model and performs effects.
+mod cards;
+mod clips;
+mod demo;
+mod dialogs;
+mod state;
+mod worker;
+
 use crate::{
     diagnostics::human_bytes,
-    discovery,
-    jobs::Jobs,
-    media,
-    model::*,
-    pipeline,
-    settings::{self, Destination, Settings, Workflow},
+    settings::{Destination, Settings, Workflow},
 };
 use adw::prelude::*;
 use gtk::{gio, glib};
-use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::mpsc, time::Duration};
+use state::{Card, Effect, Model, Msg, Placement, Preflight, Screen};
+use std::{
+    cell::{Cell, OnceCell, RefCell},
+    path::{Path, PathBuf},
+    rc::Rc,
+    time::{Duration, Instant},
+};
+use worker::{DestinationKind, LocationInfo, Scope, Worker};
 
-enum Command {
-    PrepareArchivedEditing(String, usize),
-    Scan(Settings),
-    Plan(Settings, Vec<Candidate>, bool),
-    Start(Box<Batch>),
-    Retry(String, Option<usize>),
-    Select(u8, PathBuf, Settings),
-    History,
-    Export(String, PathBuf),
-    Cleanup(String, bool),
-    Probe(usize, Settings, Candidate),
-}
-enum Reply {
-    ScanProgress(usize, PathBuf),
-    Scan(Vec<Candidate>),
-    Plan(Box<Batch>),
-    Finished(Box<Batch>),
-    Settings(Settings),
-    History(Vec<Batch>),
-    Probe(usize, Candidate),
-    Error(String),
-    Info(String),
-}
-struct State {
-    settings: Settings,
-    candidates: Vec<Candidate>,
-    batch: Option<Batch>,
-    busy: bool,
-    ready: bool,
-    cancel: Cancel,
+const APP_ID: &str = "io.github.resolve_ingest.ResolveIngest";
+
+pub(crate) struct App {
+    model: RefCell<Model>,
+    worker: Worker,
     demo: bool,
-    closing: bool,
-    filter: u32,
-    file_type: String,
-    since: Option<chrono::NaiveDate>,
-    activities: std::collections::BTreeMap<Lane, ActivityProgress>,
+    ui: OnceCell<Ui>,
+    preflight_timer: RefCell<Option<glib::SourceId>>,
+    text_css: gtk::CssProvider,
+    monitor: RefCell<Option<gio::VolumeMonitor>>,
+    allow_close: Cell<bool>,
 }
-struct ActivityProgress {
-    item: usize,
-    stage: String,
-    began: std::time::Instant,
-    first: u64,
-    bytes: u64,
-    total: u64,
-}
-#[derive(Clone)]
-struct Row {
-    index: usize,
-    candidate: Candidate,
-    item: Option<Item>,
-}
-#[derive(Clone)]
-struct View {
+
+struct Ui {
     window: adw::ApplicationWindow,
-    source: gtk::Label,
-    archive: gtk::Label,
-    editing: gtk::Label,
-    banner: gtk::Label,
-    summary: gtk::Label,
-    stage: gtk::Label,
+    toasts: adw::ToastOverlay,
+    title: adw::WindowTitle,
+    banner: adw::Banner,
+    stack: gtk::Stack,
+    setup_rows: [adw::ActionRow; 2],
+    cards: gtk::ListBox,
+    shown_cards: RefCell<Vec<Card>>,
+    waiting_chips: [gtk::Button; 2],
+    scan_title: gtk::Label,
+    scan_detail: gtk::Label,
+    headline: gtk::Label,
+    subline: gtk::Label,
+    chips: [gtk::Button; 2],
     progress: gtk::ProgressBar,
+    progress_box: gtk::Box,
+    progress_text: gtk::Label,
+    activity: gtk::Label,
+    list_tools: gtk::Box,
+    list_stack: gtk::Stack,
+    empty: adw::StatusPage,
+    show_archived: gtk::Button,
+    clips: clips::Clips,
+    bar_title: gtk::Label,
+    bar_detail: gtk::Label,
+    placement: gtk::DropDown,
     start: gtk::Button,
     cancel: gtk::Button,
-    scan: gtk::Button,
-    mode: gtk::DropDown,
-    placement: gtk::DropDown,
-    browse: gtk::Button,
-    type_filter: gtk::DropDown,
-    bulk_actions: gtk::Box,
-    output_column: Rc<RefCell<glib::WeakRef<gtk::ColumnViewColumn>>>,
-    settings_window: Rc<RefCell<glib::WeakRef<adw::PreferencesWindow>>>,
-    settings_rows: Rc<RefCell<Vec<glib::WeakRef<adw::ActionRow>>>>,
-    settings_feedback: Rc<RefCell<glib::WeakRef<gtk::Label>>>,
-    settings_appearance: Rc<RefCell<glib::WeakRef<adw::PreferencesGroup>>>,
-    output_actions: gtk::FlowBox,
-    status_labels: Rc<RefCell<std::collections::HashMap<usize, gtk::Label>>>,
-    store: gio::ListStore,
-    state: Rc<RefCell<State>>,
-    tx: mpsc::Sender<Command>,
+    eject: gtk::Button,
+    retry: gtk::Button,
+    open_editing: gtk::Button,
+    new_session: gtk::Button,
+    view: adw::ToolbarView,
+    prefs: RefCell<Option<dialogs::PrefsRows>>,
 }
-fn label(text: &str, class: &str) -> gtk::Label {
-    let l = gtk::Label::new(Some(text));
-    l.set_xalign(0.);
-    l.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    if !class.is_empty() {
-        l.add_css_class(class);
+
+impl App {
+    fn ui(&self) -> &Ui {
+        self.ui.get().expect("window built")
     }
-    l
 }
-fn ellipsize(l: &gtk::Label) {
-    l.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    l.set_hexpand(true);
-    l.set_max_width_chars(70);
-}
-pub fn run(demo: bool) {
-    let app = adw::Application::builder()
-        .application_id("io.github.resolve_ingest.ResolveIngest")
-        .build();
-    app.connect_activate(move |app| build(app, demo));
+
+/// Starts the desktop app, optionally opening `folder` as soon as the window is ready.
+pub fn run(demo: bool, folder: Option<PathBuf>) {
+    let app = adw::Application::builder().application_id(APP_ID).build();
+    app.connect_startup(|_| {
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+        let css = gtk::CssProvider::new();
+        css.load_from_string(include_str!("style.css"));
+        gtk::style_context_add_provider_for_display(
+            &gtk::gdk::Display::default().unwrap(),
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
+    app.connect_activate(move |application| {
+        if let Some(window) = application.active_window() {
+            window.present();
+            return;
+        }
+        build(application, demo, folder.clone());
+    });
     app.run_with_args(&["resolve-ingest"]);
 }
-fn worker(rx: mpsc::Receiver<Command>, tx: mpsc::Sender<Reply>, events: Events, cancel: Cancel) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut jobs = match Jobs::open(&settings::data_dir()) {
-            Ok(j) => j,
-            Err(e) => {
-                let _ = tx.send(Reply::Error(format!("{e:#}")));
-                return;
-            }
-        };
-        if let Ok(h) = jobs.history() {
-            let interrupted: Vec<_> = h.into_iter().filter(|b| b.status != "Completed").collect();
-            if !interrupted.is_empty() {
-                let _ = tx.send(Reply::History(interrupted));
-            }
-        }
-        while let Ok(command) = rx.recv() {
-            let result: anyhow::Result<Reply> = rt.block_on(async {
-                Ok(match command {
-                    Command::PrepareArchivedEditing(id, index) => { let mut batch = jobs.load(&id)?; pipeline::prepare_archived_editing(&mut jobs, &mut batch, index, &cancel, &events).await?; Reply::Finished(Box::new(batch)) }
-                    Command::Scan(s) => {
-                        let converting = s.workflow == Workflow::Convert;
-                        let mut c = discovery::scan_with_progress(&s.source, &cancel, converting, |count, path| {
-                            let _ = tx.send(Reply::ScanProgress(count, path.to_path_buf()));
-                        }).await?;
-                        if converting { for c in &mut c { c.selected = c.editing; } }
-                        Reply::Scan(c)
-                    },
-                    Command::Plan(mut s, c, alongside) => { if s.workflow == Workflow::Convert && alongside { s.editing = Some(Destination::select(s.source.clone(), false)?); } Reply::Plan(Box::new(pipeline::plan(s, c, &cancel).await?)) },
-                    Command::Start(mut b) => { jobs.save(&b)?; pipeline::run(&mut jobs, &mut b, None, &cancel, &events).await?; Reply::Finished(b) }
-                    Command::Retry(id, only) => { let mut b = jobs.load(&id)?; pipeline::run(&mut jobs, &mut b, only, &cancel, &events).await?; Reply::Finished(Box::new(b)) }
-                    Command::Select(which, path, mut s) => {
-                        match which { 0 => s.source = std::fs::canonicalize(path)?, 1 => s.archive = Some(Destination::select(path, true)?), _ => s.editing = Some(Destination::select(path, false)?) }
-                        s.save()?; Reply::Settings(s)
-                    }
-                    Command::History => Reply::History(jobs.history()?),
-                    Command::Export(id, path) => { crate::diagnostics::export(&jobs.load(&id)?, &path)?; Reply::Info(format!("Report saved to {}", path.display())) }
-                    Command::Cleanup(id, remove) => {
-                        let batch = jobs.load(&id)?;
-                        if remove { Reply::Info(format!("Removed {} of owned partial files.", human_bytes(pipeline::cleanup(&jobs, &batch)?))) }
-                        else { let partials = pipeline::stale_partials(&batch)?; Reply::Info(format!("{} owned partials, {}. Use Remove owned partials in History to clean up. Verified files are retained.", partials.len(), human_bytes(partials.iter().map(|p| p.2).sum()))) }
-                    }
-                    Command::Probe(i, s, mut c) => {
-                        let file = crate::storage::Root::source(&s.source)?.read(&c.relative)?;
-                        c.probe = Some(media::probe(&file, Some(jobs.lock_fd()), &cancel).await?); c.probe_error = None;
-                        c.editing = c.probe.as_ref().is_some_and(|p| p.video().is_some()); Reply::Probe(i, c)
-                    }
-                })
-            });
-            let _ = tx.send(match result {
-                Ok(r) => r,
-                Err(e) => Reply::Error(format!("{e:#}")),
-            });
-        }
-    });
+
+fn demo_settings() -> Settings {
+    let destination = |path: &str| Destination {
+        path: path.into(),
+        expected_mount: String::new(),
+        shared: false,
+    };
+    Settings {
+        archive: Some(destination("/mnt/nas/Footage Archive")),
+        editing: Some(destination("/home/me/Videos/Resolve Media")),
+        ..Default::default()
+    }
 }
-fn build(app: &adw::Application, demo: bool) {
-    adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
-    let css = gtk::CssProvider::new();
-    css.load_from_string(include_str!("style.css"));
-    gtk::style_context_add_provider_for_display(
-        &gtk::gdk::Display::default().unwrap(),
-        &css,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-    let loaded = Settings::load();
-    let error = loaded
-        .as_ref()
-        .err()
-        .map(|e| format!("Settings could not be loaded: {e:#}"));
-    let state = Rc::new(RefCell::new(State {
-        settings: loaded.unwrap_or_default(),
-        candidates: vec![],
-        batch: None,
-        busy: false,
-        ready: false,
-        cancel: Cancel::default(),
+
+fn build(application: &adw::Application, demo: bool, folder: Option<PathBuf>) {
+    let (settings, load_error) = if demo {
+        (demo_settings(), None)
+    } else {
+        match Settings::load() {
+            Ok(s) => (s, None),
+            Err(e) => (
+                Settings::default(),
+                Some(format!("Settings could not be loaded: {e:#}")),
+            ),
+        }
+    };
+    let app = Rc::new(App {
+        model: RefCell::new(Model::new(settings)),
+        worker: Worker::spawn(demo),
         demo,
-        closing: false,
-        filter: 0,
-        file_type: String::new(),
-        since: None,
-        activities: Default::default(),
-    }));
-    let text_css = gtk::CssProvider::new();
-    text_css.load_from_string(&format!(
-        "window {{ font-size: {}px; }}",
-        state.borrow().settings.text_scale * 15.
-    ));
+        ui: OnceCell::new(),
+        preflight_timer: RefCell::new(None),
+        text_css: gtk::CssProvider::new(),
+        monitor: RefCell::new(None),
+        allow_close: Cell::new(false),
+    });
     gtk::style_context_add_provider_for_display(
         &gtk::gdk::Display::default().unwrap(),
-        &text_css,
+        &app.text_css,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
     );
-    let (tx, commands) = mpsc::channel();
-    let (replies, rx) = mpsc::channel();
-    let (events, erx) = mpsc::sync_channel(64);
-    if !demo {
-        worker(commands, replies, events, state.borrow().cancel.clone());
+    let ui = build_ui(application, &app);
+    let _ = app.ui.set(ui);
+    install_actions(application, &app);
+    apply_appearance(&app);
+    if let Some(error) = load_error {
+        app.model.borrow_mut().problem = Some(error);
     }
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .title("Resolve Ingest")
-        .default_width(1100)
-        .default_height(800)
-        .build();
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&adw::WindowTitle::new("Resolve Ingest", "")));
-    let history = action_button("History");
-    let settings_button = action_button("Settings");
-    header.pack_end(&settings_button);
-    header.pack_end(&history);
-    root.append(&header);
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.add_css_class("content");
-    content.set_vexpand(true);
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let mode = gtk::DropDown::from_strings(&["Archive + convert", "Convert existing files"]);
-    mode.set_selected(u32::from(
-        state.borrow().settings.workflow == Workflow::Convert,
-    ));
-    mode.update_property(&[gtk::accessible::Property::Label("Workflow")]);
-    let placement =
-        gtk::DropDown::from_strings(&["Alongside originals", "Use editing destination"]);
-    placement.update_property(&[gtk::accessible::Property::Label(
-        "Conversion output location",
-    )]);
-    let browse = action_button("Choose source folder…");
-    actions.append(&mode);
-    actions.append(&placement);
-    actions.append(&browse);
-    content.append(&actions);
-    let locations = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    locations.add_css_class("locations");
-    let (source_row, source) = location("Source folder");
-    let (archive_row, archive) = location("Original archive");
-    let (editing_row, editing) = location("Editing destination");
-    locations.append(&source_row);
-    locations.append(&archive_row);
-    locations.append(&editing_row);
-    content.append(&locations);
-    let banner = label(
-        "Choose a source folder, then scan for footage. Archive and editing locations are managed in Settings.",
-        "banner",
-    );
-    banner.set_wrap(true);
-    content.append(&banner);
-    let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    let clips_title = label("Footage", "heading");
-    clips_title.set_hexpand(true);
-    toolbar.append(&clips_title);
-    let filter = gtk::DropDown::from_strings(&["All files", "Needs attention", "Completed"]);
-    filter.set_tooltip_text(Some("Filter clip list"));
-    toolbar.append(&filter);
-    let scan = action_button("Scan folder");
-    toolbar.append(&scan);
-    content.append(&toolbar);
-    let bulk_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let type_filter = gtk::DropDown::from_strings(&["All types"]);
-    type_filter.update_property(&[gtk::accessible::Property::Label("File type filter")]);
-    let since = gtk::Entry::builder()
-        .placeholder_text("Since YYYY-MM-DD")
-        .width_chars(17)
-        .build();
-    since.update_property(&[gtk::accessible::Property::Label(
-        "Show recordings on or after this date",
-    )]);
-    let select_shown = action_button("Select shown only");
-    let clear_selection = action_button("Clear selection");
-    bulk_actions.append(&type_filter);
-    bulk_actions.append(&since);
-    bulk_actions.append(&select_shown);
-    bulk_actions.append(&clear_selection);
-    content.append(&bulk_actions);
 
-    let store = gio::ListStore::new::<glib::BoxedAnyObject>();
-    let stage = label("Ready when you are", "heading");
-    stage.set_wrap(true);
-    let summary = label("No files selected", "muted");
-    summary.set_wrap(true);
-    let progress = gtk::ProgressBar::new();
-    progress.set_tooltip_text(Some("Batch progress counts verified originals and editing copies. Live activity shows each worker's progress."));
-    progress.set_show_text(false);
-    let start = action_button("Preview output files");
-    start.add_css_class("suggested-action");
-    let cancel = action_button("Cancel");
-    cancel.set_visible(false);
-    let output_actions = gtk::FlowBox::new();
-    output_actions.set_selection_mode(gtk::SelectionMode::None);
-    output_actions.set_column_spacing(8);
-    output_actions.set_row_spacing(4);
-    output_actions.set_max_children_per_line(4);
-    output_actions.set_visible(false);
-    let view = View {
-        window: window.clone(),
-        source,
-        editing,
-        archive,
-        banner,
-        summary,
-        stage,
-        progress,
-        start,
-        cancel,
-        scan,
-        mode,
-        placement,
-        browse,
-        type_filter,
-        bulk_actions,
-        output_column: Rc::new(RefCell::new(glib::WeakRef::new())),
-        settings_window: Rc::new(RefCell::new(glib::WeakRef::new())),
-        settings_rows: Rc::new(RefCell::new(Vec::new())),
-        settings_feedback: Rc::new(RefCell::new(glib::WeakRef::new())),
-        settings_appearance: Rc::new(RefCell::new(glib::WeakRef::new())),
-        output_actions,
-        status_labels: Rc::new(RefCell::new(std::collections::HashMap::new())),
-        store: store.clone(),
-        state: state.clone(),
-        tx,
-    };
-    let list = table::build(&view);
-    let scroller = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vexpand(true)
-        .child(&list)
-        .min_content_height(120)
-        .build();
-    content.append(&scroller);
-    let body_scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&content)
-        .build();
-    root.append(&body_scroll);
-    let footer = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    footer.add_css_class("footer");
-    let footer_row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
-    let status = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    status.set_hexpand(true);
-    status.append(&view.stage);
-    status.append(&view.summary);
-    footer_row.append(&status);
-    footer_row.append(&view.cancel);
-    footer_row.append(&view.start);
-    footer.append(&footer_row);
-    footer.append(&view.progress);
-    footer.append(&view.output_actions);
-    for (title, archive) in [("Open originals", true), ("Open editing folder", false)] {
-        let button = action_button(title);
-        view.output_actions.insert(&button, -1);
-        let v = view.clone();
-        button.connect_clicked(move |_| {
-            let s = v.state.borrow();
-            let Some(batch) = &s.batch else {
-                return;
-            };
-            let path = if archive {
-                Some(
-                    batch
-                        .settings
-                        .archive
-                        .as_ref()
-                        .map(|d| &d.path)
-                        .unwrap_or(&batch.settings.source),
-                )
-            } else {
-                batch.settings.editing.as_ref().map(|d| &d.path)
-            };
-            if let Some(path) = path {
-                let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
-                let v2 = v.clone();
-                launcher.launch(Some(&v.window), gio::Cancellable::NONE, move |r| {
-                    if let Err(e) = r {
-                        v2.banner.set_text(&format!("Cannot open folder: {e}"));
-                    }
-                });
-            }
-        });
-    }
-    let report = action_button("Export report");
-    view.output_actions.insert(&report, -1);
-    let v = view.clone();
-    report.connect_clicked(move |_| {
-        let s = v.state.borrow();
-        let Some(batch) = &s.batch else {
-            return;
-        };
-        if s.ready || s.busy {
-            v.banner.set_text(
-                "Reports are available after the batch has started and the worker has stopped.",
-            );
-            return;
-        }
-        let id = batch.id.clone();
-        drop(s);
-        let dialog = gtk::FileDialog::builder()
-            .title("Export batch report")
-            .initial_name(format!("resolve-ingest-{id}.json"))
-            .build();
-        let v2 = v.clone();
-        dialog.save(Some(&v.window), gio::Cancellable::NONE, move |r| {
-            if let Ok(file) = r
-                && let Some(path) = file.path()
-            {
-                send(&v2, Command::Export(id, path), "Exporting report…");
-            }
-        });
-    });
-    let change = action_button("Change selection");
-    view.output_actions.insert(&change, -1);
-    let v = view.clone();
-    change.connect_clicked(move |_| {
-        if !v.state.borrow().busy {
-            let mut s = v.state.borrow_mut();
-            s.batch = None;
-            s.ready = false;
-            drop(s);
-            refresh_rows(&v);
-        }
-    });
-    root.append(&footer);
-    {
-        let v = view.clone();
-        view.browse.connect_clicked(move |_| choose_folder(&v, 0));
-    }
-    {
-        let v = view.clone();
-        view.mode.connect_selected_notify(move |mode| {
-            let workflow = if mode.selected() == 1 { Workflow::Convert } else { Workflow::Ingest };
-            {
-                let s = v.state.borrow();
-                if s.batch.as_ref().map(|b| b.settings.workflow).unwrap_or(s.settings.workflow) == workflow { return; }
-            }
-            let mut s = v.state.borrow_mut();
-            s.settings.workflow = if mode.selected() == 1 { Workflow::Convert } else { Workflow::Ingest };
-            s.batch = None; s.ready = false;
-            if s.settings.workflow == Workflow::Convert { for c in &mut s.candidates { if !c.editing { c.selected = false; } } }
-            drop(s); refresh_rows(&v);
-            v.banner.set_text(if mode.selected() == 1 { "Convert existing videos to MOV with PCM audio. Sources stay unchanged; outputs append .mov to the filename." } else { "Archive originals and create editing copies. Choose files, then preview their output paths." });
-        });
-    }
-    {
-        let v = view.clone();
-        view.placement.connect_selected_notify(move |_| {
-            let mut s = v.state.borrow_mut();
-            s.batch = None;
-            s.ready = false;
-            drop(s);
-            refresh_rows(&v);
-        });
-    }
-    {
-        let v = view.clone();
-        view.type_filter.connect_selected_notify(move |f| {
-            let text = f
-                .selected_item()
-                .and_downcast::<gtk::StringObject>()
-                .map(|s| s.string().to_string())
-                .unwrap_or_default();
-            v.state.borrow_mut().file_type = if text == "All types" {
-                String::new()
-            } else {
-                text
-            };
-            refresh_rows(&v);
-        });
-    }
-    {
-        let v = view.clone();
-        since.connect_changed(move |entry| {
-            let text = entry.text();
-            let date = if text.is_empty() {
-                None
-            } else if let Ok(date) = chrono::NaiveDate::parse_from_str(&text, "%Y-%m-%d") {
-                Some(date)
-            } else {
-                entry.add_css_class("error");
-                entry.set_tooltip_text(Some("Use YYYY-MM-DD, for example 2026-08-01"));
-                return;
-            };
-            entry.remove_css_class("error");
-            entry.set_tooltip_text(Some(
-                "Filter by recording date; * in the table indicates modification-time fallback",
-            ));
-            v.state.borrow_mut().since = date;
-            refresh_rows(&v);
-        });
-    }
-    for (button, select) in [(select_shown, true), (clear_selection, false)] {
-        let v = view.clone();
-        button.connect_clicked(move |_| {
-            if v.state.borrow().busy || v.state.borrow().batch.is_some() {
-                return;
-            }
-            let shown: std::collections::HashSet<_> = (0..v.store.n_items())
-                .map(|n| {
-                    v.store
-                        .item(n)
-                        .unwrap()
-                        .downcast::<glib::BoxedAnyObject>()
-                        .unwrap()
-                        .borrow::<Row>()
-                        .index
-                })
-                .collect();
-            for (i, c) in v.state.borrow_mut().candidates.iter_mut().enumerate() {
-                c.selected = select && shown.contains(&i);
-            }
-            refresh_rows(&v);
-        });
-    }
-    window.set_content(Some(&root));
-    {
-        let v = view.clone();
-        settings_button.connect_clicked(move |_| settings_dialog(&v));
-    }
-    {
-        let v = view.clone();
-        history.connect_clicked(move |_| {
-            if !v.state.borrow().busy {
-                send(&v, Command::History, "Loading history…");
-            }
-        });
-    }
-    {
-        let v = view.clone();
-        view.scan.connect_clicked(move |_| {
-            if v.state.borrow().demo {
-                demo_rows(&v);
-                return;
-            }
-            let s = v.state.borrow().settings.clone();
-            send(&v, Command::Scan(s), "Scanning source and probing media…");
-        });
-    }
-    {
-        let v = view.clone();
-        filter.connect_selected_notify(move |f| {
-            v.state.borrow_mut().filter = f.selected();
-            refresh_rows(&v);
-        });
-    }
-    {
-        let v = view.clone();
-        view.start.connect_clicked(move |_| {
-            if v.state.borrow().demo {
-                demo_progress(&v);
-                return;
-            }
-            let s = v.state.borrow();
-            if let Some(b) = &s.batch {
-                if s.ready {
-                    let b = b.clone();
-                    drop(s);
-                    send(&v, Command::Start(Box::new(b)), "Starting durable ingest…");
-                    return;
-                }
-                let id = b.id.clone();
-                drop(s);
-                send(
-                    &v,
-                    Command::Retry(id, None),
-                    "Revalidating recorded work and retrying…",
+    if demo {
+        // A synthetic card arrives shortly after launch, as a real one would.
+        let weak = Rc::downgrade(&app);
+        glib::timeout_add_local_once(Duration::from_millis(900), move || {
+            if let Some(app) = weak.upgrade() {
+                dispatch(
+                    &app,
+                    Msg::CardsChanged(vec![Card {
+                        name: "DJI Action 4".into(),
+                        path: "/run/media/demo/DJI_ACTION4".into(),
+                        can_eject: true,
+                    }]),
                 );
-                return;
             }
-            let (settings, candidates) = (s.settings.clone(), s.candidates.clone());
-            drop(s);
-            send(
-                &v,
-                Command::Plan(settings, candidates, v.placement.selected() == 0),
-                "Checking locations, space, and publication support…",
-            );
         });
-    }
-    {
-        let v = view.clone();
-        view.cancel.connect_clicked(move |_| {
-            v.state.borrow().cancel.request();
-            v.stage
-                .set_text("Cancellation pending · waiting for the active worker to stop");
-            v.cancel.set_sensitive(false);
+    } else {
+        let weak = Rc::downgrade(&app);
+        let monitor = cards::watch(move |cards| {
+            if let Some(app) = weak.upgrade() {
+                dispatch(&app, Msg::CardsChanged(cards));
+            }
         });
+        *app.monitor.borrow_mut() = Some(monitor);
     }
-    {
-        let v = view.clone();
-        window.connect_close_request(move |_| {
-        if !v.state.borrow().busy { return glib::Propagation::Proceed; }
-        let dialog = adw::MessageDialog::new(Some(&v.window), Some("Ingest is still active"), Some("Canceling waits for the worker to stop. A stalled share may take longer to respond."));
-        dialog.add_responses(&[("keep", "Keep ingesting"), ("cancel", "Cancel and close")]); dialog.set_default_response(Some("keep")); dialog.set_close_response("keep");
-        let v = v.clone(); dialog.connect_response(None, move |_, response| { if response == "cancel" { let mut s = v.state.borrow_mut(); s.closing = true; s.cancel.request(); v.stage.set_text("Cancellation pending · window closes when work stops"); } }); dialog.present(); glib::Propagation::Stop
+    // A file opens its folder, e.g. from a file manager's "Open With".
+    let folder = folder.map(|p| match p.parent() {
+        Some(parent) if p.is_file() => parent.to_path_buf(),
+        _ => p,
     });
+    if let Some(folder) = folder {
+        let weak = Rc::downgrade(&app);
+        // After the first card notification, so a card folder is recognized as one.
+        glib::idle_add_local_once(move || {
+            if let Some(app) = weak.upgrade() {
+                let workflow = if cards::is_card(&folder) {
+                    Workflow::Ingest
+                } else {
+                    Workflow::Convert
+                };
+                dispatch(&app, Msg::UseSource(folder, workflow));
+            }
+        });
     }
-    let v = view.clone();
+
+    let weak = Rc::downgrade(&app);
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        for event in erx.try_iter().take(128) {
-            match event {
-                Event::Activity { lane, item, active } => {
-                    if !v.state.borrow().busy {
-                        continue;
-                    }
-                    let mut s = v.state.borrow_mut();
-                    if active {
-                        s.activities.insert(
-                            lane,
-                            ActivityProgress {
-                                item,
-                                stage: "Starting…".into(),
-                                began: std::time::Instant::now(),
-                                first: 0,
-                                bytes: 0,
-                                total: 0,
-                            },
-                        );
-                    } else if s.activities.get(&lane).is_some_and(|p| p.item == item) {
-                        s.activities.remove(&lane);
-                    }
-                    drop(s);
-                    refresh_activity(&v);
-                }
-                Event::Progress {
-                    item,
-                    stage,
-                    bytes,
-                    total,
-                } => {
-                    if !v.state.borrow().busy {
-                        continue;
-                    }
-                    let mut s = v.state.borrow_mut();
-                    let lane = Lane::for_stage(&stage);
-                    let p = s
-                        .activities
-                        .entry(lane)
-                        .or_insert_with(|| ActivityProgress {
-                            item,
-                            stage: stage.clone(),
-                            began: std::time::Instant::now(),
-                            first: bytes,
-                            bytes,
-                            total,
-                        });
-                    if p.item != item || p.stage != stage || bytes < p.bytes {
-                        p.began = std::time::Instant::now();
-                        p.first = bytes;
-                    }
-                    p.item = item;
-                    p.stage = stage;
-                    p.bytes = bytes;
-                    p.total = total;
-                    drop(s);
-                    refresh_activity(&v);
-                }
-                Event::Item { index, item } => {
-                    if let Some(b) = &mut v.state.borrow_mut().batch
-                        && index < b.items.len()
-                    {
-                        b.items[index] = *item;
-                    }
-                    update_row(&v, index);
-                    refresh_activity(&v);
-                    if let Some(b) = &v.state.borrow().batch {
-                        v.summary.set_text(&b.summary());
-                    }
-                }
-                Event::Message(m) => v.banner.set_text(m.lines().next().unwrap_or(&m)),
-            }
-        }
-        for reply in rx.try_iter() {
-            if let Reply::ScanProgress(count, path) = reply {
-                if !v.state.borrow().cancel.requested() {
-                    v.stage.set_text(&format!(
-                        "Scanning · {count} files checked · {}",
-                        path.display()
-                    ));
-                    v.progress.pulse();
-                }
-                continue;
-            }
-            v.state.borrow_mut().busy = false;
-            v.state.borrow_mut().activities.clear();
-            // The reply follows all worker events. Discard any that arrived after this tick's event drain.
-            for _ in erx.try_iter() {}
-            match reply {
-                Reply::ScanProgress(..) => unreachable!(),
-                Reply::Scan(c) => {
-                    v.stage.set_text("Select files, then preview their outputs");
-                    v.progress.set_fraction(0.);
-                    let mut s = v.state.borrow_mut();
-                    s.candidates = c;
-                    s.batch = None;
-                    s.ready = false;
-                    drop(s);
-                    refresh_rows(&v);
-                    rebuild_types(&v);
-                    let note = if v.state.borrow().settings.workflow == Workflow::Convert {
-                        " Resolve cache, proxy, gallery, and project-backup subfolders were excluded."
-                    } else {
-                        ""
-                    };
-                    v.banner.set_text(&format!("Sort by clicking a column heading. Filter by type or date, then use Select shown only. * marks a modification-date fallback.{note}"));
-                }
-                Reply::Plan(b) => {
-                    v.stage
-                        .set_text("Output preview ready · use Details to inspect each path");
-                    v.progress.set_fraction(0.);
-                    let staging = if b.staging_bytes() > 0 {
-                        format!(
-                            " · Temporary local copies up to {}",
-                            human_bytes(b.staging_bytes())
-                        )
-                    } else {
-                        String::new()
-                    };
-                    if b.settings.workflow == Workflow::Convert {
-                        v.banner.set_text(&format!("Convert {} video{} · Estimated output {} · Source files stay unchanged. Output filenames are shown below.", b.items.len(), if b.items.len() == 1 { "" } else { "s" }, human_bytes(b.editing_bytes)));
-                    } else {
-                        v.banner.set_text(&format!("{} files to archive · Archive {} · Editing estimate {}{staging}. Details shows each output path.", b.items.len(), human_bytes(b.archive_bytes), human_bytes(b.editing_bytes)));
-                    }
-                    let mut s = v.state.borrow_mut();
-                    s.batch = Some(*b);
-                    s.ready = true;
-                    drop(s);
-                    refresh_rows(&v);
-                }
-                Reply::Finished(b) => {
-                    v.banner
-                        .set_text(&format!("{} · {}", b.status, b.summary()));
-                    v.stage.set_text(&b.status);
-                    v.progress.set_fraction(b.verified_fraction());
-                    let mut s = v.state.borrow_mut();
-                    s.batch = Some(*b);
-                    s.ready = false;
-                    drop(s);
-                    refresh_rows(&v);
-                }
-                Reply::Settings(settings) => {
-                    settings_feedback(
-                        &v,
-                        "Location saved. Return to the main screen to scan and review your ingest.",
-                    );
-                    let mut s = v.state.borrow_mut();
-                    if s.settings.source != settings.source {
-                        s.candidates.clear();
-                    }
-                    s.settings = settings;
-                    s.batch = None;
-                    s.ready = false;
-                    drop(s);
-                    refresh_rows(&v);
-                    v.banner
-                        .set_text("Location saved. Scan and review before starting a new batch.");
-                }
-                Reply::History(batches) => {
-                    if !batches.is_empty() {
-                        history_dialog(&v, batches);
-                    } else {
-                        v.banner.set_text("No previous batches yet.");
-                    }
-                }
-                Reply::Probe(index, c) => {
-                    v.state.borrow_mut().candidates[index] = c;
-                    v.state.borrow_mut().batch = None;
-                    refresh_rows(&v);
-                }
-                Reply::Error(e) => {
-                    settings_feedback(&v, &e);
-                    v.banner.set_text(&e);
-                    v.stage.set_text("Needs attention · see the message above");
-                }
-                Reply::Info(info) => v.banner.set_text(&info),
-            }
-            refresh(&v);
-            if v.state.borrow().closing {
-                v.window.close();
-            }
-        }
+        let Some(app) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        pump(&app);
         glib::ControlFlow::Continue
     });
-    if demo {
-        demo_rows(&view);
-    } else if let Some(e) = error {
-        view.banner.set_text(&e);
-    }
-    refresh(&view);
-    window.present();
-}
-fn refresh_activity(v: &View) {
-    let s = v.state.borrow();
-    if !s.busy || s.cancel.requested() {
-        return;
-    }
-    let lines: Vec<_> = s
-        .activities
-        .iter()
-        .map(|(lane, p)| {
-            let detail = if p.total == 0 {
-                String::new()
-            } else if p.stage.contains("Converting") || p.stage.contains("full decode") {
-                format!(
-                    " · {:.0}s / {:.0}s",
-                    p.bytes as f64 / 1e6,
-                    p.total as f64 / 1e6
-                )
-            } else {
-                let elapsed = p.began.elapsed().as_secs_f64();
-                let speed = if elapsed > 1. {
-                    format!(
-                        " · {}/s",
-                        human_bytes((p.bytes.saturating_sub(p.first) as f64 / elapsed) as u64)
-                    )
-                } else {
-                    String::new()
-                };
-                format!(
-                    " · {} / {}{speed}",
-                    human_bytes(p.bytes),
-                    human_bytes(p.total)
-                )
-            };
-            format!(
-                "{} · File {} · {}{detail}",
-                lane.label(),
-                p.item + 1,
-                p.stage
-            )
-        })
-        .collect();
-    if !lines.is_empty() {
-        v.stage.set_text(&lines.join("\n"));
-    } else {
-        v.stage.set_text("Finishing queued work…");
-    }
-    if let Some(batch) = &s.batch {
-        v.progress.set_fraction(batch.verified_fraction());
-    }
-}
-fn location(title: &str) -> (gtk::Box, gtk::Label) {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    row.add_css_class("location");
-    let name = label(title, "muted");
-    name.set_width_chars(18);
-    let path = label("Not configured", "");
-    path.set_selectable(true);
-    ellipsize(&path);
-    row.append(&name);
-    row.append(&path);
-    (row, path)
-}
-fn send(v: &View, command: Command, stage: &str) {
-    if v.state.borrow().busy {
-        return;
-    }
-    settings_feedback(v, stage);
-    v.state
-        .borrow()
-        .cancel
-        .0
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    match v.tx.send(command) {
-        Ok(()) => {
-            v.state.borrow_mut().busy = true;
-            v.state.borrow_mut().activities.clear();
-            v.stage.set_text(stage);
-            v.cancel.set_sensitive(true);
-            refresh(v);
-        }
-        Err(_) => v
-            .banner
-            .set_text("Worker unavailable. Close other instances and restart the application."),
-    }
-}
-fn refresh(v: &View) {
-    let s = v.state.borrow();
-    let settings = s.batch.as_ref().map(|b| &b.settings).unwrap_or(&s.settings);
-    v.source
-        .set_text(if settings.source.as_os_str().is_empty() {
-            "Not configured"
-        } else {
-            settings.source.to_str().unwrap_or("Non-UTF8 source")
-        });
-    let converting = settings.workflow == Workflow::Convert;
-    v.archive.set_text(if converting {
-        "Not used for conversion"
-    } else {
-        settings
-            .archive
-            .as_ref()
-            .and_then(|d| d.path.to_str())
-            .unwrap_or("Not configured")
+    render(&app);
+    // Widgets hold the app weakly; the window owns it until it is destroyed.
+    let owner = RefCell::new(Some(app.clone()));
+    app.ui().window.connect_destroy(move |_| {
+        owner.borrow_mut().take();
     });
-    v.editing.set_text(
-        if converting && s.batch.is_none() && v.placement.selected() == 0 {
-            "Alongside each source · filename + .mov"
-        } else {
-            settings
-                .editing
-                .as_ref()
-                .and_then(|d| d.path.to_str())
-                .unwrap_or("Not configured")
-        },
-    );
-    for l in [&v.archive, &v.editing] {
-        l.set_tooltip_text(Some(l.text().as_str()));
+    app.ui().window.present();
+}
+
+/// Drains the worker. Progress arrives in bursts, so rows are refreshed at most once a tick.
+fn pump(app: &Rc<App>) {
+    let (replies, events) = app.worker.drain();
+    let running = app.model.borrow().screen == Screen::Running;
+    if !events.is_empty() {
+        dispatch(app, Msg::Events(events, Instant::now()));
+    } else if running {
+        render(app);
     }
-    v.mode
-        .set_selected(u32::from(settings.workflow == Workflow::Convert));
-    v.mode.set_sensitive(!s.busy);
-    v.browse.set_sensitive(!s.busy);
-    v.placement.set_visible(converting);
-    v.placement.set_sensitive(!s.busy);
-    v.bulk_actions.set_sensitive(!s.busy && s.batch.is_none());
-    if let Some(column) = v.output_column.borrow().upgrade() {
-        column.set_visible(s.batch.is_some());
-    }
-    v.source.set_tooltip_text(Some(v.source.text().as_str()));
-    refresh_settings(v, &s.settings, s.busy);
-    v.output_actions.set_visible(s.batch.is_some());
-    v.output_actions.set_sensitive(!s.busy);
-    v.scan
-        .set_sensitive(!s.busy && (!s.settings.source.as_os_str().is_empty() || s.demo));
-    v.cancel.set_visible(s.busy);
-    let selected = s.candidates.iter().filter(|c| c.selected).count();
-    v.start
-        .set_sensitive(!s.busy && (selected > 0 || s.batch.is_some() || s.demo));
-    v.start.set_label(if s.ready {
-        if settings.workflow == Workflow::Convert {
-            "Convert files"
-        } else {
-            "Archive & convert"
-        }
-    } else if s.batch.is_some() {
-        "Recheck / Retry"
-    } else {
-        "Preview output files"
-    });
-    if s.batch.is_none() {
-        v.summary.set_text(&format!(
-            "{} shown · {selected} selected · {} scanned",
-            v.store.n_items(),
-            s.candidates.len()
-        ));
-        if selected == 0 && !s.busy {
-            v.stage
-                .set_text(if s.settings.source.as_os_str().is_empty() {
-                    "Choose a source folder to enable scanning"
-                } else {
-                    "Scan the folder and select files to process"
-                });
-        }
-    } else if let Some(batch) = &s.batch {
-        v.summary.set_text(&batch.summary());
-    }
-    if s.settings.high_contrast {
-        v.window.add_css_class("high-contrast");
-    } else {
-        v.window.remove_css_class("high-contrast");
+    for reply in replies {
+        dispatch(app, Msg::Reply(reply));
     }
 }
-fn visible_candidate(s: &State, c: &Candidate) -> bool {
-    (s.file_type.is_empty() || crate::catalog::file_type(c) == s.file_type)
-        && s.since
-            .is_none_or(|since| crate::catalog::recorded(c).date.date() >= since)
-}
-fn rebuild_types(v: &View) {
-    let types: std::collections::BTreeSet<_> = {
-        let s = v.state.borrow();
-        if let Some(b) = &s.batch {
-            b.items
-                .iter()
-                .map(|i| crate::catalog::file_type(&i.source))
-                .collect()
-        } else {
-            s.candidates.iter().map(crate::catalog::file_type).collect()
-        }
-    };
-    let mut names = vec!["All types".to_string()];
-    names.extend(types);
-    let model = gtk::StringList::new(&names.iter().map(String::as_str).collect::<Vec<_>>());
-    v.type_filter.set_model(Some(&model));
-    v.type_filter.set_selected(0);
-}
-fn refresh_rows(v: &View) {
-    v.store.remove_all();
-    let s = v.state.borrow();
-    if let Some(b) = &s.batch {
-        for (index, i) in b.items.iter().enumerate() {
-            if !visible_candidate(&s, &i.source) {
-                continue;
-            }
-            if s.filter == 1 && i.error.is_none() {
-                continue;
-            }
-            if s.filter == 2 && !i.complete() {
-                continue;
-            }
-            v.store.append(&glib::BoxedAnyObject::new(Row {
-                index,
-                candidate: i.source.clone(),
-                item: Some(i.clone()),
-            }));
-        }
-    } else {
-        for (index, c) in s.candidates.iter().enumerate() {
-            if !visible_candidate(&s, c) {
-                continue;
-            }
-            if s.filter == 2 || (s.filter == 1 && c.probe_error.is_none()) {
-                continue;
-            }
-            v.store.append(&glib::BoxedAnyObject::new(Row {
-                index,
-                candidate: c.clone(),
-                item: None,
-            }));
-        }
-    }
-    drop(s);
-    refresh(v);
-}
-fn update_row(v: &View, index: usize) {
-    let s = v.state.borrow();
-    let Some(b) = &s.batch else {
-        return;
-    };
-    let Some(item) = b.items.get(index) else {
-        return;
-    };
-    let include = visible_candidate(&s, &item.source)
-        && (s.filter == 0
-            || (s.filter == 1 && item.error.is_some())
-            || (s.filter == 2 && item.complete()));
-    let mut insertion = v.store.n_items();
-    for pos in 0..v.store.n_items() {
-        let object = v
-            .store
-            .item(pos)
-            .unwrap()
-            .downcast::<glib::BoxedAnyObject>()
-            .unwrap();
-        if object.borrow::<Row>().index == index {
-            if !include {
-                v.store.remove(pos);
-                return;
-            }
-            object.borrow_mut::<Row>().item = Some(item.clone());
-            if let Some(label) = v.status_labels.borrow().get(&index) {
-                render_status(label, item);
-            }
-            return;
-        }
-        if object.borrow::<Row>().index > index {
-            insertion = insertion.min(pos);
-        }
-    }
-    if include {
-        v.store.insert(
-            insertion,
-            &glib::BoxedAnyObject::new(Row {
-                index,
-                candidate: item.source.clone(),
-                item: Some(item.clone()),
-            }),
-        );
-    }
-}
-fn render_status(status: &gtk::Label, item: &Item) {
-    for class in ["success", "error", "warning"] {
-        status.remove_css_class(class);
-    }
-    let text = if item.archive == Stage::NotRequested {
-        format!("Conversion: {}", item.editing)
-    } else {
-        format!("Archive: {} · Editing: {}", item.archive, item.editing)
-    };
-    status.set_text(&text);
-    status.set_tooltip_text(Some(item.error.as_deref().unwrap_or(&text)));
-    status.add_css_class(if item.complete() {
-        "success"
-    } else if item.error.is_some() {
-        "error"
-    } else {
-        "warning"
-    });
-}
-fn choose_folder(v: &View, which: u8) {
-    if v.state.borrow().busy {
-        return;
-    }
-    let dialog = gtk::FileDialog::builder()
-        .title(match which {
-            0 => "Select source folder",
-            1 => "Select OS-mounted CIFS archive",
-            _ => "Select editing destination",
-        })
-        .build();
-    let v = v.clone();
-    let window: gtk::Window = v
-        .settings_window
-        .borrow()
-        .upgrade()
-        .map(|w| w.upcast())
-        .unwrap_or_else(|| v.window.clone().upcast());
-    dialog.select_folder(Some(&window), gio::Cancellable::NONE, move |result| {
-        if let Ok(file) = result {
-            if let Some(path) = file.path() {
-                if v.state.borrow().demo {
-                    settings_feedback(
-                        &v,
-                        &format!(
-                            "Prototype selection: {}. Demo does not save preferences.",
-                            path.display()
-                        ),
-                    );
-                    v.banner.set_text(&format!(
-                        "Prototype selection: {}. Demo does not save settings or write media.",
-                        path.display()
-                    ));
-                    return;
-                }
-                let s = v.state.borrow().settings.clone();
-                send(
-                    &v,
-                    Command::Select(which, path, s),
-                    "Validating selected location…",
-                );
-            } else {
-                settings_feedback(
-                    &v,
-                    "Select an OS-mounted folder. smb:// and GVfs locations are unsupported.",
-                );
-                v.banner.set_text(
-                    "Select an OS-mounted folder. smb:// and GVfs locations are unsupported.",
-                );
-            }
-        }
-    });
-}
-fn details_dialog(v: &View, row: Row) {
-    let text = if let Some(i) = &row.item {
-        serde_json::to_string_pretty(i).unwrap_or_default()
-    } else {
-        serde_json::to_string_pretty(&row.candidate).unwrap_or_default()
-    };
-    let dialog = adw::MessageDialog::new(
-        Some(&v.window),
-        Some(&row.candidate.relative.to_string_lossy()),
-        Some(if row.item.is_some() {
-            "Verification evidence, planned relative paths, and attempt diagnostics."
-        } else if v.state.borrow().settings.workflow == Workflow::Convert {
-            "Source metadata and conversion diagnostics. Converted MOV files keep the original video and use PCM audio."
-        } else {
-            "Choose whether this original also needs an editing copy. Sidecars are archived independently."
-        }),
-    );
-    let box_ = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    let copy = action_button("Copy diagnostics");
-    let copied = text.clone();
-    copy.connect_clicked(move |b| b.clipboard().set_text(&copied));
-    box_.append(&copy);
-    if let Some(batch) = &v.state.borrow().batch
-        && let Some(item) = &row.item
-    {
-        let paths = format!(
-            "Original: {}\nOutput: {}",
-            batch
-                .settings
-                .archive
-                .as_ref()
-                .map(|d| d.path.join(&item.archive_path))
-                .unwrap_or_else(|| batch.settings.source.join(&item.source.relative))
-                .display(),
-            item.editing_path
-                .as_ref()
-                .and_then(|p| batch.settings.editing.as_ref().map(|e| e
-                    .path
-                    .join(p)
-                    .display()
-                    .to_string()))
-                .unwrap_or_else(|| "Not requested".into())
-        );
-        let l = label(&paths, "muted");
-        l.set_wrap(true);
-        l.set_selectable(true);
-        box_.append(&l);
-    }
-    let diagnostics = gtk::TextView::new();
-    diagnostics.set_editable(false);
-    diagnostics.set_monospace(true);
-    diagnostics.set_wrap_mode(gtk::WrapMode::WordChar);
-    diagnostics.buffer().set_text(&text);
-    let scroll = gtk::ScrolledWindow::builder()
-        .child(&diagnostics)
-        .min_content_height(220)
-        .max_content_height(350)
-        .build();
-    box_.append(&scroll);
-    dialog.set_extra_child(Some(&box_));
-    dialog.add_response("close", "Close");
-    if !v.state.borrow().busy {
-        if row.item.is_none() {
-            if v.state.borrow().settings.workflow == Workflow::Ingest {
-                dialog.add_response("archive", "Archive only");
-            }
-            dialog.add_response("probe", "Retry probe");
-        } else if !v.state.borrow().ready {
-            dialog.add_response("retry", "Retry this file");
-            if row
-                .item
-                .as_ref()
-                .is_some_and(|i| i.archive == Stage::Verified && i.editing == Stage::NotRequested)
-            {
-                dialog.add_response("prepare", "Probe archived video");
-            }
-        }
-    }
-    let v = v.clone();
-    dialog.connect_response(None, move |_, response| match response {
-        "archive" => {
-            if let Some(c) = v.state.borrow_mut().candidates.get_mut(row.index) {
-                c.editing = false;
-                c.selected = true;
-            }
-            refresh_rows(&v);
-        }
-        "probe" => {
-            let s = v.state.borrow().settings.clone();
-            send(
-                &v,
-                Command::Probe(row.index, s, row.candidate.clone()),
-                "Probing selected file…",
-            );
-        }
-        "retry" => {
-            let id = v.state.borrow().batch.as_ref().unwrap().id.clone();
-            send(
-                &v,
-                Command::Retry(id, Some(row.index)),
-                "Retrying selected file…",
-            );
-        }
-        "prepare" => {
-            let id = v.state.borrow().batch.as_ref().unwrap().id.clone();
-            send(
-                &v,
-                Command::PrepareArchivedEditing(id, row.index),
-                "Probing the verified original…",
-            );
-        }
-        _ => (),
-    });
-    dialog.present();
-}
-fn action_button(title: &str) -> gtk::Button {
-    let button = gtk::Button::with_label(title);
-    button.add_css_class("ingest-action");
-    button
-}
-fn refresh_settings(v: &View, settings: &Settings, busy: bool) {
-    if let Some(group) = v.settings_appearance.borrow().upgrade() {
-        group.set_sensitive(!busy);
-    }
-    if let Some(window) = v.settings_window.borrow().upgrade() {
-        if settings.high_contrast {
-            window.add_css_class("high-contrast");
-        } else {
-            window.remove_css_class("high-contrast");
-        }
-    }
-    let paths = [
-        if settings.source.as_os_str().is_empty() {
-            "Not configured".into()
-        } else {
-            settings.source.display().to_string()
-        },
-        settings
-            .archive
-            .as_ref()
-            .map(|d| d.path.display().to_string())
-            .unwrap_or_else(|| "Not configured".into()),
-        settings
-            .editing
-            .as_ref()
-            .map(|d| d.path.display().to_string())
-            .unwrap_or_else(|| "Not configured".into()),
-    ];
-    for (row, path) in v.settings_rows.borrow().iter().zip(paths) {
-        if let Some(row) = row.upgrade() {
-            row.set_subtitle(&path);
-            row.set_tooltip_text(Some(&path));
-            row.set_sensitive(!busy);
-        }
-    }
-}
-fn settings_feedback(v: &View, message: &str) {
-    if let Some(label) = v.settings_feedback.borrow().upgrade() {
-        label.set_text(message);
-    }
-}
-fn save_appearance(v: &View) {
-    let s = v.state.borrow();
-    let css = gtk::CssProvider::new();
-    css.load_from_string(&format!(
-        "window {{ font-size: {}px; }}",
-        s.settings.text_scale * 15.
-    ));
-    gtk::style_context_add_provider_for_display(
-        &gtk::prelude::WidgetExt::display(&v.window),
-        &css,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
-    );
-    let result = if s.demo { Ok(()) } else { s.settings.save() };
-    drop(s);
-    match result {
-        Ok(()) => settings_feedback(v, "Appearance updated."),
-        Err(e) => settings_feedback(v, &format!("Could not save preferences: {e:#}")),
-    }
-    refresh(v);
-}
-fn settings_dialog(v: &View) {
-    if let Some(window) = v.settings_window.borrow().upgrade() {
-        window.present();
-        return;
-    }
-    let window = adw::PreferencesWindow::builder()
-        .transient_for(&v.window)
-        .modal(true)
-        .title("Settings")
-        .default_width(680)
-        .default_height(760)
-        .search_enabled(false)
-        .build();
-    *v.settings_window.borrow_mut() = window.downgrade();
-    let page = adw::PreferencesPage::new();
-    page.set_title("Ingest settings");
-    let locations = adw::PreferencesGroup::new();
-    locations.set_title("Locations");
-    locations.set_description(Some("Remembered for repeat ingests. Folder choices save automatically and apply to the next ingest."));
+
+pub(crate) fn dispatch(app: &Rc<App>, msg: Msg) {
+    let effects = app.model.borrow_mut().update(msg);
     let mut rows = Vec::new();
-    for (title, which) in [
-        ("Source folder", 0),
-        ("Original archive", 1),
-        ("Editing destination", 2),
-    ] {
-        let row = adw::ActionRow::new();
-        row.set_title(title);
-        row.set_use_markup(false);
-        row.set_subtitle_lines(2);
-        row.set_subtitle_selectable(true);
-        let choose = action_button("Choose folder…");
-        choose.set_valign(gtk::Align::Center);
-        choose.update_property(&[gtk::accessible::Property::Label(&format!(
-            "Choose {title} folder"
-        ))]);
-        row.add_suffix(&choose);
-        row.set_activatable_widget(Some(&choose));
-        let v = v.clone();
-        choose.connect_clicked(move |_| choose_folder(&v, which));
-        rows.push(row.downgrade());
-        locations.add(&row);
-    }
-    *v.settings_rows.borrow_mut() = rows;
-    page.add(&locations);
-    let feedback_group = adw::PreferencesGroup::new();
-    let feedback = label(
-        if v.state.borrow().busy {
-            "Settings can be changed after the current worker stops."
-        } else {
-            "Preferences save automatically. Ingest starts only from the main screen."
-        },
-        "muted",
-    );
-    feedback.set_wrap(true);
-    feedback.set_selectable(true);
-    *v.settings_feedback.borrow_mut() = feedback.downgrade();
-    feedback_group.add(&feedback);
-    page.add(&feedback_group);
-    let storage_help = adw::PreferencesGroup::new();
-    storage_help.set_description(Some("Originals need an OS-mounted CIFS share. Mount and authenticate the NAS through Linux first. Editing copies can use local storage or CIFS."));
-    page.add(&storage_help);
-    let conversion = adw::PreferencesGroup::new();
-    conversion.set_title("Editing copies");
-    for (title, subtitle) in [
-        (
-            "Processing",
-            "Local copies and archiving overlap. Convert batches run up to two FFmpeg jobs at once; editing files publish after verification.",
-        ),
-        ("Video", "Keep the original codec without re-encoding"),
-        (
-            "Audio",
-            "24-bit PCM at the original sample rate and channel layout",
-        ),
-        (
-            "Verification",
-            "Original checksum readback; editing stream checks, full decode, and checksum",
-        ),
-    ] {
-        let row = adw::ActionRow::new();
-        row.set_title(title);
-        row.set_subtitle(subtitle);
-        row.set_subtitle_lines(0);
-        conversion.add(&row);
-    }
-    page.add(&conversion);
-    let appearance = adw::PreferencesGroup::new();
-    *v.settings_appearance.borrow_mut() = appearance.downgrade();
-    appearance.set_title("Appearance");
-    let contrast = adw::SwitchRow::new();
-    contrast.set_title("High contrast");
-    contrast.set_active(v.state.borrow().settings.high_contrast);
-    let v2 = v.clone();
-    contrast.connect_active_notify(move |row| {
-        v2.state.borrow_mut().settings.high_contrast = row.is_active();
-        save_appearance(&v2);
-    });
-    appearance.add(&contrast);
-    let scale_row = adw::ActionRow::new();
-    scale_row.set_title("Text size");
-    let scale = gtk::DropDown::from_strings(&["100%", "150%", "200%"]);
-    scale.set_valign(gtk::Align::Center);
-    scale.update_property(&[gtk::accessible::Property::Label("Text size")]);
-    scale.set_selected(((v.state.borrow().settings.text_scale - 1.) * 2.) as u32);
-    let v2 = v.clone();
-    scale.connect_selected_notify(move |scale| {
-        v2.state.borrow_mut().settings.text_scale = 1. + f64::from(scale.selected()) * 0.5;
-        save_appearance(&v2);
-    });
-    scale_row.add_suffix(&scale);
-    appearance.add(&scale_row);
-    page.add(&appearance);
-    window.add(&page);
-    refresh(v);
-    window.present();
-}
-fn history_dialog(v: &View, batches: Vec<Batch>) {
-    let dialog = adw::MessageDialog::new(
-        Some(&v.window),
-        Some("Batch history & recovery"),
-        Some(
-            "Recovery rechecks recorded files before reuse. Interrupted copies restart in a new owned partial. Select a batch to inspect or retry.",
-        ),
-    );
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    for b in batches.into_iter().take(100) {
-        let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        let text = label(
-            &format!(
-                "{} · {}\n{}",
-                chrono::DateTime::parse_from_rfc3339(&b.created_at)
-                    .map(|d| d.format("%d %b %Y · %H:%M UTC").to_string())
-                    .unwrap_or_else(|_| b.created_at.clone()),
-                b.status,
-                b.summary()
-            ),
-            "muted",
-        );
-        text.set_wrap(true);
-        row.append(&text);
-        let actions = gtk::FlowBox::new();
-        actions.set_selection_mode(gtk::SelectionMode::None);
-        actions.set_column_spacing(8);
-        actions.set_max_children_per_line(4);
-        let load = action_button("View / Recover");
-        let report = action_button("Report");
-        let inspect = action_button("Partials");
-        let cleanup = action_button("Remove owned partials");
-        for button in [&load, &report, &inspect, &cleanup] {
-            actions.insert(button, -1);
+    for effect in effects {
+        match effect {
+            Effect::RefreshRow(i) => rows.push(i),
+            other => perform(app, other),
         }
-        row.append(&actions);
-        let v2 = v.clone();
-        let b2 = b.clone();
-        let d = dialog.clone();
-        load.connect_clicked(move |_| {
-            let mut s = v2.state.borrow_mut();
-            s.batch = Some(b2.clone());
-            s.ready = false;
-            drop(s);
-            refresh_rows(&v2);
-            v2.stage
-                .set_text(&format!("{} · verification recorded earlier", b2.status));
-            v2.banner.set_text(
-                "Recovered journal. Press Recheck / Retry to validate files and resume this batch.",
-            );
-            d.close();
-        });
-        let v2 = v.clone();
-        let id = b.id.clone();
-        report.connect_clicked(move |_| {
-            let dialog = gtk::FileDialog::builder()
-                .title("Export batch report")
-                .initial_name(format!("resolve-ingest-{id}.json"))
-                .build();
-            let v = v2.clone();
-            let id = id.clone();
-            dialog.save(Some(&v2.window), gio::Cancellable::NONE, move |result| {
-                if let Ok(file) = result
-                    && let Some(path) = file.path()
-                {
-                    send(&v, Command::Export(id, path), "Exporting report…");
+    }
+    if !rows.is_empty() {
+        let model = app.model.borrow();
+        for i in rows {
+            app.ui().clips.refresh(&model, i);
+        }
+    }
+    render(app);
+}
+
+fn perform(app: &Rc<App>, effect: Effect) {
+    let ui = app.ui();
+    match effect {
+        Effect::Send(command) => {
+            if !app.worker.send(command) {
+                toast(
+                    app,
+                    "The background worker stopped. Restart the application.",
+                );
+            }
+        }
+        Effect::CancelWorker => app.worker.cancel(),
+        Effect::SchedulePreflight => {
+            if let Some(id) = app.preflight_timer.borrow_mut().take() {
+                id.remove();
+            }
+            let weak = Rc::downgrade(app);
+            let id = glib::timeout_add_local_once(Duration::from_millis(350), move || {
+                if let Some(app) = weak.upgrade() {
+                    app.preflight_timer.borrow_mut().take();
+                    dispatch(&app, Msg::RunPreflight);
                 }
             });
-        });
-        let v2 = v.clone();
-        let id = b.id.clone();
-        let d = dialog.clone();
-        inspect.connect_clicked(move |_| {
-            d.close();
-            send(
-                &v2,
-                Command::Cleanup(id.clone(), false),
-                "Inspecting owned partials…",
-            )
-        });
-        let v2 = v.clone();
-        let id = b.id.clone();
-        cleanup.connect_clicked(move |_| {
-            send(
-                &v2,
-                Command::Cleanup(id.clone(), true),
-                "Cleaning owned partials…",
-            )
-        });
-        content.append(&row);
+            *app.preflight_timer.borrow_mut() = Some(id);
+        }
+        Effect::RebuildRows => ui.clips.rebuild(&app.model.borrow()),
+        Effect::RefreshRows => ui.clips.refresh_all(&app.model.borrow()),
+        Effect::RefreshRow(i) => ui.clips.refresh(&app.model.borrow(), i),
+        Effect::SaveSettings => {
+            if !app.demo
+                && let Err(e) = app.model.borrow().settings.save()
+            {
+                toast(app, &format!("Could not save preferences: {e:#}"));
+            }
+        }
+        Effect::ApplyAppearance => apply_appearance(app),
+        Effect::Toast(text) => toast(app, &text),
+        Effect::Notify { title, body } => {
+            if !ui.window.is_active()
+                && let Some(application) = ui.window.application()
+            {
+                let notification = gio::Notification::new(&title);
+                notification.set_body(Some(&body));
+                application.send_notification(Some("batch-finished"), &notification);
+            }
+        }
+        Effect::ShowHistory(batches) => dialogs::history(app, batches),
+        Effect::ShowPartials { batch, files } => dialogs::partials(app, batch, files),
+        Effect::Close => {
+            app.allow_close.set(true);
+            ui.window.close();
+        }
     }
-    let scroll = gtk::ScrolledWindow::builder()
-        .child(&content)
-        .min_content_height(300)
-        .max_content_height(500)
+}
+
+pub(crate) fn toast(app: &App, text: &str) {
+    let toast = adw::Toast::new(text);
+    toast.set_timeout(4);
+    app.ui().toasts.add_toast(toast);
+}
+
+fn apply_appearance(app: &App) {
+    let model = app.model.borrow();
+    app.text_css.load_from_string(&format!(
+        "window {{ font-size: {}px; }}",
+        model.settings.text_scale * 15.
+    ));
+    if let Some(ui) = app.ui.get() {
+        if model.settings.high_contrast {
+            ui.window.add_css_class("high-contrast");
+        } else {
+            ui.window.remove_css_class("high-contrast");
+        }
+    }
+}
+
+/// Wraps a handler so it holds the app weakly; widgets never keep the app alive.
+fn on<T: ?Sized>(app: &Rc<App>, f: impl Fn(&Rc<App>, &T) + 'static) -> impl Fn(&T) + 'static {
+    let weak = Rc::downgrade(app);
+    move |arg| {
+        if let Some(app) = weak.upgrade() {
+            f(&app, arg);
+        }
+    }
+}
+
+fn pill(label: &str, suggested: bool) -> gtk::Button {
+    let button = gtk::Button::with_label(label);
+    button.add_css_class("pill");
+    if suggested {
+        button.add_css_class("suggested-action");
+    }
+    button
+}
+
+fn boxed_list() -> gtk::ListBox {
+    let list = gtk::ListBox::new();
+    list.add_css_class("boxed-list");
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list
+}
+
+fn wrap_box() -> gtk::FlowBox {
+    gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .max_children_per_line(4)
+        .column_spacing(6)
+        .row_spacing(6)
+        .build()
+}
+
+fn build_ui(application: &adw::Application, app: &Rc<App>) -> Ui {
+    let weak = Rc::downgrade(app);
+    let window = adw::ApplicationWindow::builder()
+        .application(application)
+        .title("Resolve Ingest")
+        .default_width(1100)
+        .default_height(760)
+        .width_request(360)
+        .height_request(480)
         .build();
-    dialog.set_extra_child(Some(&scroll));
-    dialog.add_response("close", "Close");
-    dialog.present();
+
+    let header = adw::HeaderBar::new();
+    let title = adw::WindowTitle::new("Resolve Ingest", "");
+    header.set_title_widget(Some(&title));
+    let menu = gio::Menu::new();
+    let session = gio::Menu::new();
+    session.append(Some("Choose Folder…"), Some("win.choose-folder"));
+    session.append(Some("Convert Files…"), Some("win.convert"));
+    session.append(Some("Rescan"), Some("win.rescan"));
+    menu.append_section(None, &session);
+    let general = gio::Menu::new();
+    general.append(Some("History"), Some("win.history"));
+    general.append(Some("Preferences"), Some("win.preferences"));
+    general.append(Some("About Resolve Ingest"), Some("win.about"));
+    menu.append_section(None, &general);
+    let menu_button = gtk::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .menu_model(&menu)
+        .primary(true)
+        .tooltip_text("Main Menu")
+        .build();
+    header.pack_end(&menu_button);
+
+    let banner = adw::Banner::new("");
+    banner.connect_button_clicked(on(app, |app, _: &adw::Banner| {
+        let interrupted = {
+            let mut model = app.model.borrow_mut();
+            model.problem.take().is_none() && std::mem::take(&mut model.interrupted) > 0
+        };
+        if interrupted {
+            dispatch(app, Msg::RequestHistory);
+        } else {
+            render(app);
+        }
+    }));
+
+    let stack = gtk::Stack::builder()
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .vexpand(true)
+        .build();
+
+    // Setup: the two remembered destinations. The screen advances once both are set.
+    let setup_rows = [
+        location_row(app, DestinationKind::Archive),
+        location_row(app, DestinationKind::Editing),
+    ];
+    let setup_list = boxed_list();
+    for row in &setup_rows {
+        setup_list.append(row);
+    }
+    let setup = status_page(
+        "folder-download-symbolic",
+        "Where should footage go?",
+        "Originals are copied to the archive and checked byte for byte. Editing copies keep the camera's video and get 24-bit PCM audio for Resolve.",
+        &clamp(&setup_list, 520),
+    );
+    stack.add_named(&setup, Some("setup"));
+
+    // Waiting: no source yet.
+    let cards = boxed_list();
+    cards.set_visible(false);
+    let choose = pill("Choose Folder…", false);
+    choose.set_action_name(Some("win.choose-folder"));
+    let convert = gtk::Button::with_label("Convert Existing Files…");
+    convert.add_css_class("flat");
+    convert.set_action_name(Some("win.convert"));
+    let buttons = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    buttons.set_halign(gtk::Align::Center);
+    buttons.append(&choose);
+    buttons.append(&convert);
+    let waiting_chips = [
+        chip(app, DestinationKind::Archive),
+        chip(app, DestinationKind::Editing),
+    ];
+    let waiting_locations = wrap_box();
+    waiting_locations.set_halign(gtk::Align::Center);
+    for c in &waiting_chips {
+        waiting_locations.append(c);
+    }
+    let waiting_box = gtk::Box::new(gtk::Orientation::Vertical, 24);
+    waiting_box.append(&cards);
+    waiting_box.append(&buttons);
+    waiting_box.append(&waiting_locations);
+    let waiting = status_page(
+        "media-flash-symbolic",
+        "Insert a camera card",
+        "Cards are found automatically. Clips that are already in the archive are left unselected.",
+        &clamp(&waiting_box, 560),
+    );
+    stack.add_named(&waiting, Some("waiting"));
+
+    // Scanning.
+    let spinner = gtk::Spinner::builder()
+        .spinning(true)
+        .width_request(32)
+        .height_request(32)
+        .halign(gtk::Align::Center)
+        .build();
+    let scan_title = gtk::Label::new(None);
+    scan_title.add_css_class("title-1");
+    scan_title.set_wrap(true);
+    scan_title.set_justify(gtk::Justification::Center);
+    let scan_detail = gtk::Label::new(None);
+    scan_detail.add_css_class("dim-label");
+    scan_detail.add_css_class("numeric");
+    scan_detail.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    scan_detail.set_max_width_chars(60);
+    let scan_cancel = pill("Cancel", false);
+    scan_cancel.set_halign(gtk::Align::Center);
+    scan_cancel.connect_clicked(on(app, |app, _: &gtk::Button| dispatch(app, Msg::Cancel)));
+    let scan_box = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    scan_box.set_valign(gtk::Align::Center);
+    scan_box.set_margin_start(24);
+    scan_box.set_margin_end(24);
+    scan_box.append(&spinner);
+    scan_box.append(&scan_title);
+    scan_box.append(&scan_detail);
+    scan_box.append(&scan_cancel);
+    stack.add_named(&scan_box, Some("scanning"));
+
+    // Session: review, running, and done share the clip table.
+    let headline = gtk::Label::builder().xalign(0.).wrap(true).build();
+    headline.add_css_class("title-2");
+    let subline = gtk::Label::builder()
+        .xalign(0.)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .build();
+    subline.add_css_class("dim-label");
+    let chips = [
+        chip(app, DestinationKind::Archive),
+        chip(app, DestinationKind::Editing),
+    ];
+    let chip_box = wrap_box();
+    chip_box.set_halign(gtk::Align::Start);
+    for c in &chips {
+        chip_box.append(c);
+    }
+    let heading = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    heading.append(&headline);
+    heading.append(&subline);
+    heading.append(&chip_box);
+
+    let progress = gtk::ProgressBar::new();
+    progress.add_css_class("batch-progress");
+    let progress_text = gtk::Label::builder()
+        .xalign(0.)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    progress_text.add_css_class("numeric");
+    let activity = gtk::Label::builder()
+        .xalign(0.)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .build();
+    activity.add_css_class("dim-label");
+    activity.add_css_class("caption");
+    let progress_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    progress_box.append(&progress);
+    progress_box.append(&progress_text);
+    progress_box.append(&activity);
+
+    let select_new = gtk::Button::with_label("Select New");
+    select_new.add_css_class("flat");
+    select_new.connect_clicked(on(app, |app, _: &gtk::Button| {
+        dispatch(app, Msg::SelectNew)
+    }));
+    let select_none = gtk::Button::with_label("Select None");
+    select_none.add_css_class("flat");
+    select_none.connect_clicked(on(app, |app, _: &gtk::Button| {
+        dispatch(app, Msg::SelectNone)
+    }));
+    let filter_menu = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("Show")
+        .build();
+    filter_menu.add_css_class("flat");
+    {
+        let weak = weak.clone();
+        filter_menu.set_create_popup_func(move |button| {
+            if let Some(app) = weak.upgrade() {
+                button.set_popover(Some(&filter_popover(&app)));
+            }
+        });
+    }
+    let list_tools = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    list_tools.set_halign(gtk::Align::End);
+    list_tools.append(&select_new);
+    list_tools.append(&select_none);
+    list_tools.append(&filter_menu);
+
+    let clips = clips::Clips::new(&weak);
+    let session = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    session.add_css_class("session");
+    session.append(&heading);
+    session.append(&progress_box);
+    session.append(&list_tools);
+    let show_archived = pill("Show Archived Clips", false);
+    show_archived.set_halign(gtk::Align::Center);
+    show_archived.connect_clicked(on(app, |app, _: &gtk::Button| {
+        dispatch(app, Msg::ShowArchived(true))
+    }));
+    let empty = adw::StatusPage::builder()
+        .icon_name("object-select-symbolic")
+        .child(&show_archived)
+        .build();
+    empty.add_css_class("compact");
+    let list_stack = gtk::Stack::new();
+    list_stack.add_named(&clips.widget, Some("list"));
+    list_stack.add_named(&empty, Some("empty"));
+    session.append(&list_stack);
+    stack.add_named(&session, Some("session"));
+
+    // Bottom bar: one summary and the actions for the current screen.
+    let bar_title = gtk::Label::builder()
+        .xalign(0.)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    bar_title.add_css_class("heading");
+    bar_title.add_css_class("numeric");
+    let bar_detail = gtk::Label::builder()
+        .xalign(0.)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .lines(2)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    bar_detail.add_css_class("caption");
+    let summary = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    summary.set_hexpand(true);
+    summary.set_valign(gtk::Align::Center);
+    summary.append(&bar_title);
+    summary.append(&bar_detail);
+    let placement =
+        gtk::DropDown::from_strings(&["Save beside originals", "Save to editing folder"]);
+    placement.set_valign(gtk::Align::Center);
+    placement.update_property(&[gtk::accessible::Property::Label("Where converted files go")]);
+    placement.connect_selected_notify(on(app, |app, d: &gtk::DropDown| {
+        let p = if d.selected() == 0 {
+            Placement::Beside
+        } else {
+            Placement::EditingFolder
+        };
+        if app.model.borrow().placement != p {
+            dispatch(app, Msg::Placement(p));
+        }
+    }));
+    let start = pill("Ingest", true);
+    start.set_action_name(Some("win.start"));
+    let cancel = pill("Cancel", false);
+    cancel.connect_clicked(on(app, |app, _: &gtk::Button| dispatch(app, Msg::Cancel)));
+    let eject = pill("Eject Card", false);
+    eject.connect_clicked(on(app, |app, _: &gtk::Button| eject_card(app)));
+    let retry = pill("Retry Failed", false);
+    retry.connect_clicked(on(app, |app, _: &gtk::Button| {
+        dispatch(app, Msg::Retry(Scope::Incomplete))
+    }));
+    let new_session = pill("Done", false);
+    new_session.connect_clicked(on(app, |app, _: &gtk::Button| dispatch(app, Msg::Back)));
+    let open_editing = pill("Open Editing Folder", true);
+    open_editing.connect_clicked(on(app, |app, _: &gtk::Button| {
+        open_location(app, DestinationKind::Editing)
+    }));
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_valign(gtk::Align::Center);
+    actions.set_halign(gtk::Align::End);
+    actions.append(&placement);
+    actions.append(&cancel);
+    actions.append(&eject);
+    actions.append(&new_session);
+    actions.append(&retry);
+    actions.append(&open_editing);
+    actions.append(&start);
+    let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    bottom.add_css_class("bottom-bar");
+    bottom.append(&summary);
+    bottom.append(&actions);
+
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&header);
+    view.add_top_bar(&banner);
+    view.set_content(Some(&stack));
+    view.add_bottom_bar(&bottom);
+    view.set_bottom_bar_style(adw::ToolbarStyle::Raised);
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&view));
+    window.set_content(Some(&toasts));
+
+    // Narrow windows stack the summary above the actions.
+    let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        700.,
+        adw::LengthUnit::Sp,
+    ));
+    narrow.add_setter(
+        &bottom,
+        "orientation",
+        Some(&gtk::Orientation::Vertical.to_value()),
+    );
+    narrow.add_setter(
+        &actions,
+        "orientation",
+        Some(&gtk::Orientation::Vertical.to_value()),
+    );
+    narrow.add_setter(&actions, "halign", Some(&gtk::Align::Fill.to_value()));
+    clips.add_narrow_setters(&narrow);
+    window.add_breakpoint(narrow);
+
+    // Dropping a card folder ingests it; any other folder is converted in place.
+    let drop = gtk::DropTarget::new(
+        gtk::gdk::FileList::static_type(),
+        gtk::gdk::DragAction::COPY,
+    );
+    {
+        let weak = weak.clone();
+        drop.connect_drop(move |_, value, _, _| {
+            let (Some(app), Ok(list)) = (weak.upgrade(), value.get::<gtk::gdk::FileList>()) else {
+                return false;
+            };
+            let Some(path) = list.files().first().and_then(|f| f.path()) else {
+                return false;
+            };
+            let folder = if path.is_dir() {
+                path
+            } else {
+                match path.parent() {
+                    Some(p) => p.to_path_buf(),
+                    None => return false,
+                }
+            };
+            let workflow = if cards::is_card(&folder) {
+                Workflow::Ingest
+            } else {
+                Workflow::Convert
+            };
+            dispatch(&app, Msg::UseSource(folder, workflow));
+            true
+        });
+    }
+    window.add_controller(drop);
+
+    window.connect_close_request(move |window| {
+        let Some(app) = weak.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        if app.allow_close.get() || app.model.borrow().screen != Screen::Running {
+            return glib::Propagation::Proceed;
+        }
+        dialogs::confirm_close(&app, window);
+        glib::Propagation::Stop
+    });
+
+    Ui {
+        window,
+        toasts,
+        title,
+        banner,
+        stack,
+        setup_rows,
+        cards,
+        shown_cards: RefCell::new(vec![]),
+        waiting_chips,
+        scan_title,
+        scan_detail,
+        headline,
+        subline,
+        chips,
+        progress,
+        progress_box,
+        progress_text,
+        activity,
+        list_tools,
+        list_stack,
+        empty,
+        show_archived,
+        clips,
+        bar_title,
+        bar_detail,
+        placement,
+        start,
+        cancel,
+        eject,
+        retry,
+        open_editing,
+        new_session,
+        view,
+        prefs: RefCell::new(None),
+    }
 }
-fn demo_rows(v: &View) {
-    let mut s = v.state.borrow_mut();
-    s.candidates = (0..1000)
-        .map(|i| Candidate {
-            relative: PathBuf::from(format!("DCIM/100MEDIA/DJI_20260904_{i:04}_D.MP4")),
-            identity: Identity {
-                dev: 0,
-                ino: i,
-                size: 148_000_000,
-                mtime: 0,
-                mtime_ns: 0,
-                ctime: 0,
-                ctime_ns: 0,
-            },
-            probe: None,
-            probe_error: (i == 3).then(|| "Malformed media · retry probe or archive only".into()),
-            selected: true,
-            editing: i != 3,
-            sidecar_for: None,
+
+fn status_page(
+    icon: &str,
+    title: &str,
+    description: &str,
+    child: &impl IsA<gtk::Widget>,
+) -> adw::StatusPage {
+    adw::StatusPage::builder()
+        .icon_name(icon)
+        .title(title)
+        .description(description)
+        .child(child)
+        .build()
+}
+
+fn clamp(child: &impl IsA<gtk::Widget>, width: i32) -> adw::Clamp {
+    adw::Clamp::builder()
+        .maximum_size(width)
+        .child(child)
+        .build()
+}
+
+fn location_row(app: &Rc<App>, kind: DestinationKind) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(match kind {
+            DestinationKind::Archive => "Archive",
+            DestinationKind::Editing => "Editing copies",
         })
-        .collect();
-    drop(s);
-    rebuild_types(v);
-    v.banner.set_text("Interactive prototype · 1,000 synthetic rows · no media writes. Preview output files simulates progress and partial failure.");
-    refresh_rows(v);
+        .subtitle_lines(2)
+        .activatable(true)
+        .build();
+    row.add_prefix(&gtk::Image::from_icon_name(location_icon(kind)));
+    let button = gtk::Button::from_icon_name("folder-open-symbolic");
+    button.add_css_class("flat");
+    button.set_valign(gtk::Align::Center);
+    button.set_tooltip_text(Some("Choose Folder"));
+    row.add_suffix(&button);
+    row.set_activatable_widget(Some(&button));
+    button.connect_clicked(on(app, move |app, _: &gtk::Button| {
+        dialogs::choose_destination(app, kind)
+    }));
+    row
 }
-fn demo_progress(v: &View) {
-    v.stage.set_text("File 4 · Checking editing copy");
-    v.summary
-        .set_text("2 editing clips ready · 1 original archived · 1 needs attention");
-    v.progress.set_fraction(0.65);
-    v.banner.set_text("Archive unavailable. Reconnect the share, then retry. 3 originals are already verified. Prototype only.");
-    v.start.set_label("Retry failed");
+
+fn location_icon(kind: DestinationKind) -> &'static str {
+    match kind {
+        DestinationKind::Archive => "drive-harddisk-symbolic",
+        DestinationKind::Editing => "video-x-generic-symbolic",
+    }
+}
+
+pub(crate) fn location_subtitle(path: Option<&Path>, info: Option<&LocationInfo>) -> String {
+    let Some(path) = path else {
+        return "Not set".into();
+    };
+    let mut text = path.display().to_string();
+    match info {
+        Some(LocationInfo { error: Some(_), .. }) => text.push_str(" · unavailable"),
+        Some(LocationInfo {
+            free: Some(free),
+            kind,
+            ..
+        }) => text.push_str(&format!(" · {kind} · {} free", human_bytes(*free))),
+        _ => (),
+    }
+    text
+}
+
+fn chip(app: &Rc<App>, kind: DestinationKind) -> gtk::Button {
+    let content = adw::ButtonContent::builder()
+        .icon_name(location_icon(kind))
+        .build();
+    let button = gtk::Button::builder().child(&content).build();
+    button.add_css_class("chip");
+    button.connect_clicked(on(app, |app, _: &gtk::Button| dialogs::preferences(app)));
+    button
+}
+
+fn render_chip(button: &gtk::Button, model: &Model, kind: DestinationKind) {
+    let content = button.child().and_downcast::<adw::ButtonContent>().unwrap();
+    let (label, info) = match kind {
+        DestinationKind::Archive => ("Archive", model.locations.archive.as_ref()),
+        DestinationKind::Editing => ("Editing", model.locations.editing.as_ref()),
+    };
+    let path = state::location_path(model, kind);
+    let name = info
+        .map(|i| i.name.clone())
+        .or_else(|| {
+            path.and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "Not set".into());
+    let detail = match info {
+        Some(LocationInfo { error: Some(_), .. }) => " · unavailable".into(),
+        Some(LocationInfo {
+            free: Some(free), ..
+        }) => format!(" · {} free", human_bytes(*free)),
+        _ => String::new(),
+    };
+    content.set_label(&format!("{label} · {name}{detail}"));
+    button.set_tooltip_text(Some(&location_subtitle(path, info)));
+    if info.is_some_and(|i| i.error.is_some()) {
+        button.add_css_class("error");
+    } else {
+        button.remove_css_class("error");
+    }
+}
+
+fn filter_popover(app: &Rc<App>) -> gtk::Popover {
+    let model = app.model.borrow();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    content.set_margin_top(6);
+    content.set_margin_bottom(6);
+    content.set_margin_start(6);
+    content.set_margin_end(6);
+    if model.workflow() == Workflow::Ingest {
+        let archived = gtk::CheckButton::with_label(&format!(
+            "Show already archived ({})",
+            model.archived_count()
+        ));
+        archived.set_active(model.filter.show_archived);
+        archived.connect_toggled(on(app, |app, c: &gtk::CheckButton| {
+            dispatch(app, Msg::ShowArchived(c.is_active()))
+        }));
+        content.append(&archived);
+        content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    }
+    let heading = gtk::Label::builder().label("File types").xalign(0.).build();
+    heading.add_css_class("heading");
+    content.append(&heading);
+    for file_type in model.file_types() {
+        let check = gtk::CheckButton::with_label(&file_type);
+        check.set_active(!model.filter.hidden_types.contains(&file_type));
+        check.connect_toggled(on(app, move |app, c: &gtk::CheckButton| {
+            dispatch(app, Msg::ShowType(file_type.clone(), c.is_active()))
+        }));
+        content.append(&check);
+    }
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(&content));
+    popover
+}
+
+fn install_actions(application: &adw::Application, app: &Rc<App>) {
+    let window = &app.ui().window;
+    let add = |name: &str, f: fn(&Rc<App>)| {
+        let action = gio::SimpleAction::new(name, None);
+        let weak = Rc::downgrade(app);
+        action.connect_activate(move |_, _| {
+            if let Some(app) = weak.upgrade() {
+                f(&app);
+            }
+        });
+        window.add_action(&action);
+    };
+    add("choose-folder", |app| {
+        dialogs::choose_source(app, Workflow::Ingest)
+    });
+    add("convert", |app| {
+        dialogs::choose_source(app, Workflow::Convert)
+    });
+    add("rescan", |app| dispatch(app, Msg::Rescan));
+    add("history", |app| dispatch(app, Msg::RequestHistory));
+    add("preferences", dialogs::preferences);
+    add("about", dialogs::about);
+    add("start", |app| dispatch(app, Msg::Start));
+    for (action, accels) in [
+        ("win.choose-folder", &["<Control>o"][..]),
+        ("win.rescan", &["<Control>r", "F5"]),
+        ("win.history", &["<Control>h"]),
+        ("win.preferences", &["<Control>comma"]),
+        ("win.start", &["<Control>Return"]),
+        ("window.close", &["<Control>w", "<Control>q"]),
+    ] {
+        application.set_accels_for_action(action, accels);
+    }
+}
+
+fn set_action(window: &adw::ApplicationWindow, name: &str, enabled: bool) {
+    if let Some(action) = window
+        .lookup_action(name)
+        .and_downcast::<gio::SimpleAction>()
+    {
+        action.set_enabled(enabled);
+    }
+}
+
+fn eject_card(app: &Rc<App>) {
+    let Some(card) = app.model.borrow().source_card().cloned() else {
+        return;
+    };
+    if app.demo {
+        dispatch(app, Msg::CardsChanged(vec![]));
+        toast(app, &format!("{} can be removed", card.name));
+        return;
+    }
+    let weak = Rc::downgrade(app);
+    cards::eject(&card.path, move |result| {
+        if let Some(app) = weak.upgrade() {
+            match result {
+                Ok(()) => toast(&app, &format!("{} can be removed", card.name)),
+                Err(e) => toast(&app, &format!("Could not eject: {e}")),
+            }
+        }
+    });
+}
+
+pub(crate) fn open_location(app: &Rc<App>, kind: DestinationKind) {
+    let path = state::location_path(&app.model.borrow(), kind).map(Path::to_path_buf);
+    open_path(app, path);
+}
+
+pub(crate) fn open_path(app: &Rc<App>, path: Option<PathBuf>) {
+    let Some(path) = path else {
+        return;
+    };
+    let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&path)));
+    let weak = Rc::downgrade(app);
+    launcher.launch(
+        Some(&app.ui().window),
+        None::<&gio::Cancellable>,
+        move |r| {
+            if let (Some(app), Err(e)) = (weak.upgrade(), r) {
+                toast(&app, &format!("Cannot open folder: {e}"));
+            }
+        },
+    );
+}
+
+fn render(app: &Rc<App>) {
+    let Some(ui) = app.ui.get() else {
+        return;
+    };
+    let model = app.model.borrow();
+    let screen = model.screen;
+
+    // Banner: a persistent problem, otherwise an interrupted-ingest notice.
+    if let Some(problem) = &model.problem {
+        ui.banner.set_title(problem);
+        ui.banner.set_button_label(Some("Dismiss"));
+        ui.banner.set_revealed(true);
+    } else if model.interrupted > 0 {
+        let n = model.interrupted;
+        ui.banner.set_title(&if n == 1 {
+            "An earlier ingest was interrupted".into()
+        } else {
+            format!("{n} earlier ingests were interrupted")
+        });
+        ui.banner.set_button_label(Some("Review"));
+        ui.banner.set_revealed(true);
+    } else {
+        ui.banner.set_revealed(false);
+    }
+
+    ui.stack.set_visible_child_name(match screen {
+        Screen::Setup => "setup",
+        Screen::Waiting => "waiting",
+        Screen::Scanning => "scanning",
+        Screen::Review | Screen::Running | Screen::Done => "session",
+    });
+    ui.title.set_subtitle(match &model.source {
+        Some(source) if !matches!(screen, Screen::Setup | Screen::Waiting) => &source.name,
+        _ => "",
+    });
+
+    let window = &ui.window;
+    let idle = !model.busy && !model.worker_failed;
+    set_action(window, "choose-folder", idle && model.configured());
+    set_action(window, "convert", idle);
+    set_action(
+        window,
+        "rescan",
+        idle && model.source.is_some() && matches!(screen, Screen::Review | Screen::Done),
+    );
+    set_action(window, "history", idle);
+    set_action(window, "preferences", screen != Screen::Running);
+    let (_, _, ready) = model.review_summary();
+    set_action(window, "start", screen == Screen::Review && ready && idle);
+
+    let paths = [
+        model.settings.archive.as_ref().map(|d| d.path.as_path()),
+        model.settings.editing.as_ref().map(|d| d.path.as_path()),
+    ];
+    let infos = [
+        model.locations.archive.as_ref(),
+        model.locations.editing.as_ref(),
+    ];
+    for ((row, path), info) in ui.setup_rows.iter().zip(paths).zip(infos) {
+        row.set_subtitle(&location_subtitle(path, info));
+    }
+    if let Some(rows) = ui.prefs.borrow().as_ref() {
+        rows.render(&model);
+    }
+    match screen {
+        Screen::Waiting => {
+            render_cards(app, ui, &model);
+            render_chip(&ui.waiting_chips[0], &model, DestinationKind::Archive);
+            render_chip(&ui.waiting_chips[1], &model, DestinationKind::Editing);
+        }
+        Screen::Scanning => {
+            let name = model.source.as_ref().map(|s| s.name.as_str()).unwrap_or("");
+            ui.scan_title.set_text(&if model.canceling {
+                "Stopping…".into()
+            } else {
+                format!("Reading {name}")
+            });
+            ui.scan_detail.set_text(&if model.scan.0 == 0 {
+                "Looking for footage…".into()
+            } else {
+                format!("{} files checked · {}", model.scan.0, model.scan.1)
+            });
+        }
+        _ => (),
+    }
+    let session = matches!(screen, Screen::Review | Screen::Running | Screen::Done);
+    ui.view.set_reveal_bottom_bars(session);
+    // Only the current screen's actions are shown (and measured).
+    for w in [
+        ui.placement.upcast_ref::<gtk::Widget>(),
+        ui.start.upcast_ref(),
+        ui.cancel.upcast_ref(),
+        ui.eject.upcast_ref(),
+        ui.retry.upcast_ref(),
+        ui.open_editing.upcast_ref(),
+        ui.new_session.upcast_ref(),
+    ] {
+        w.set_visible(false);
+    }
+    if session {
+        render_session(ui, &model, Instant::now());
+    }
+}
+
+fn render_cards(app: &Rc<App>, ui: &Ui, model: &Model) {
+    if *ui.shown_cards.borrow() == model.cards {
+        return;
+    }
+    *ui.shown_cards.borrow_mut() = model.cards.clone();
+    while let Some(child) = ui.cards.first_child() {
+        ui.cards.remove(&child);
+    }
+    ui.cards.set_visible(!model.cards.is_empty());
+    for card in &model.cards {
+        let row = adw::ActionRow::builder()
+            .title(&card.name)
+            .subtitle(card.path.display().to_string())
+            .activatable(true)
+            .build();
+        row.add_prefix(&gtk::Image::from_icon_name("media-flash-symbolic"));
+        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        let path = card.path.clone();
+        row.connect_activated(on(app, move |app, _: &adw::ActionRow| {
+            dispatch(app, Msg::UseSource(path.clone(), Workflow::Ingest))
+        }));
+        ui.cards.append(&row);
+    }
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+fn render_session(ui: &Ui, model: &Model, now: Instant) {
+    let screen = model.screen;
+    let converting = model.workflow() == Workflow::Convert;
+    let source_name = model.source.as_ref().map(|s| s.name.as_str()).unwrap_or("");
+    match screen {
+        Screen::Review => {
+            let total = model.candidates.len();
+            let archived = model.archived_count();
+            if converting {
+                ui.headline
+                    .set_text(&format!("Convert files in {source_name}"));
+                ui.subline.set_text(&format!(
+                    "{} found · sources stay unchanged; outputs are MOV with PCM audio",
+                    plural(total, "file", "files")
+                ));
+            } else {
+                let new = model.new_count();
+                ui.headline.set_text(&if new == 0 && total > 0 {
+                    "Nothing new on this card".into()
+                } else {
+                    format!("{} to ingest", plural(new, "new clip", "new clips"))
+                });
+                ui.subline.set_text(&if archived == 0 {
+                    format!("{} on {source_name}", plural(total, "file", "files"))
+                } else {
+                    format!(
+                        "{} on {source_name} · {archived} already archived",
+                        plural(total, "file", "files")
+                    )
+                });
+            }
+        }
+        Screen::Running => {
+            let n = model.batch.as_ref().map(|b| b.items.len()).unwrap_or(0);
+            ui.headline.set_text(&if model.canceling {
+                "Stopping safely…".into()
+            } else if converting {
+                format!("Converting {}", plural(n, "file", "files"))
+            } else {
+                format!("Ingesting {}", plural(n, "file", "files"))
+            });
+            ui.subline.set_text(if model.canceling {
+                "Waiting for active work to stop. Verified files are kept."
+            } else if converting {
+                "Each copy is checked before it appears in its folder."
+            } else {
+                "Originals are verified before editing copies appear in the editing folder."
+            });
+        }
+        Screen::Done => {
+            let (title, detail) = model.done_summary();
+            ui.headline.set_text(&title);
+            ui.subline.set_text(&detail);
+        }
+        _ => (),
+    }
+    render_chip(&ui.chips[0], model, DestinationKind::Archive);
+    ui.chips[0].set_visible(!converting);
+    let beside = converting
+        && match &model.batch {
+            Some(b) if model.showing_batch() => {
+                b.settings.editing.as_ref().map(|d| &d.path) == Some(&b.settings.source)
+            }
+            _ => model.placement == Placement::Beside,
+        };
+    if beside {
+        let content = ui.chips[1]
+            .child()
+            .and_downcast::<adw::ButtonContent>()
+            .unwrap();
+        content.set_label("Output · beside originals");
+        ui.chips[1].set_tooltip_text(Some("Each clip.mp4 gets a clip.mp4.mov next to it"));
+        ui.chips[1].remove_css_class("error");
+    } else {
+        render_chip(&ui.chips[1], model, DestinationKind::Editing);
+    }
+
+    let running = screen == Screen::Running;
+    ui.progress_box.set_visible(running);
+    let fraction = model.fraction();
+    ui.progress.set_fraction(fraction);
+    if running {
+        let bytes: u64 = model
+            .batch
+            .as_ref()
+            .map(|b| b.items.iter().map(|i| i.source.identity.size).sum())
+            .unwrap_or(0);
+        let eta = model
+            .remaining(now)
+            .map(state::remaining_text)
+            .unwrap_or_else(|| "estimating time…".into());
+        ui.progress_text.set_text(&format!(
+            "{:.0}% of {} · {eta}",
+            fraction * 100.,
+            human_bytes(bytes)
+        ));
+        let lines = model.activity(now);
+        ui.activity.set_text(&if lines.is_empty() {
+            "Finishing…".into()
+        } else {
+            lines.join("   ·   ")
+        });
+    }
+    let empty = screen == Screen::Review && model.visible_count() == 0;
+    ui.list_tools
+        .set_visible(screen == Screen::Review && !empty);
+    ui.list_stack
+        .set_visible_child_name(if empty { "empty" } else { "list" });
+    if empty {
+        let archived = model.archived_count();
+        if archived > 0 && !model.filter.show_archived {
+            ui.empty.set_title("All caught up");
+            ui.empty
+                .set_description(Some("Everything here is already verified in the archive."));
+            ui.show_archived.set_visible(true);
+        } else {
+            ui.empty.set_title("No footage found");
+            ui.empty.set_description(Some(if converting {
+                "This folder has no video files to convert."
+            } else {
+                "This card or folder has no files to ingest."
+            }));
+            ui.show_archived.set_visible(false);
+        }
+    }
+
+    ui.bar_detail.remove_css_class("error");
+    ui.bar_detail.add_css_class("dim-label");
+    ui.bar_detail.set_tooltip_text(None);
+    match screen {
+        Screen::Review => {
+            let (title, detail, _) = model.review_summary();
+            ui.bar_title.set_text(&title);
+            ui.bar_detail.set_text(&detail);
+            if let Preflight::Failed(e) = &model.preflight {
+                ui.bar_detail.remove_css_class("dim-label");
+                ui.bar_detail.add_css_class("error");
+                ui.bar_detail.set_tooltip_text(Some(e));
+            }
+            ui.placement.set_visible(converting);
+            ui.placement
+                .set_selected(u32::from(model.placement == Placement::EditingFolder));
+            ui.start.set_visible(true);
+            ui.start.set_label(&model.start_label());
+        }
+        Screen::Running => {
+            ui.bar_title
+                .set_text(&format!("{:.0}% complete", fraction * 100.));
+            ui.bar_detail.set_text(if model.canceling {
+                "Canceling · partial files stay marked incomplete"
+            } else {
+                "You can close the window; it asks before stopping work"
+            });
+            ui.cancel.set_visible(true);
+            ui.cancel.set_sensitive(!model.canceling);
+        }
+        Screen::Done => {
+            let failed = model.failed_count();
+            ui.bar_title.set_text(&if failed > 0 {
+                format!("{failed} need attention")
+            } else {
+                "Everything verified".into()
+            });
+            ui.bar_detail.set_text(if failed > 0 {
+                "Open a file for details, or retry the ones that failed"
+            } else if converting {
+                "Converted files are ready for Resolve"
+            } else {
+                "Originals are safe in the archive and editing copies are ready for Resolve"
+            });
+            let card = model.source_card();
+            ui.eject.set_visible(card.is_some_and(|c| c.can_eject));
+            ui.retry.set_visible(failed > 0);
+            ui.retry.set_sensitive(!model.busy);
+            // With a card inserted, Rescan lives in the menu and Eject is the next step.
+            ui.new_session.set_visible(card.is_none());
+            ui.open_editing.set_visible(true);
+            ui.open_editing.set_label(if beside {
+                "Open Folder"
+            } else {
+                "Open Editing Folder"
+            });
+        }
+        _ => (),
+    }
 }

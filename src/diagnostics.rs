@@ -10,7 +10,9 @@ pub fn export(batch: &Batch, path: &Path) -> Result<()> {
     Ok(())
 }
 pub fn human_bytes(bytes: u64) -> String {
-    if bytes >= 1024 * 1024 * 1024 {
+    if bytes >= 1024_u64.pow(4) {
+        format!("{:.1} TiB", bytes as f64 / (1024_f64.powi(4)))
+    } else if bytes >= 1024 * 1024 * 1024 {
         format!("{:.1} GiB", bytes as f64 / (1024_f64.powi(3)))
     } else if bytes >= 1024 * 1024 {
         format!("{:.1} MiB", bytes as f64 / (1024_f64.powi(2)))

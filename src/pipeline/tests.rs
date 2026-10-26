@@ -42,8 +42,8 @@ async fn fixture(count: usize) -> (tempfile::TempDir, Batch, Jobs) {
     }
     let settings = Settings {
         source: dir.path().join("source"),
-        archive: Some(Destination::select(dir.path().join("archive"), false).unwrap()),
-        editing: Some(Destination::select(dir.path().join("editing"), false).unwrap()),
+        archive: Some(Destination::select(dir.path().join("archive")).unwrap()),
+        editing: Some(Destination::select(dir.path().join("editing")).unwrap()),
         ..Default::default()
     };
     let candidates = crate::discovery::scan(&settings.source, &Cancel::default())
@@ -388,7 +388,7 @@ async fn conversion_only_writes_beside_sources_without_archiving_or_overwriting(
     let mut settings = original_batch.settings;
     settings.workflow = Workflow::Convert;
     settings.archive = None;
-    settings.editing = Some(Destination::select(settings.source.clone(), false).unwrap());
+    settings.editing = Some(Destination::select(settings.source.clone()).unwrap());
     let candidates: Vec<_> = original_batch.items.into_iter().map(|i| i.source).collect();
     let original = fs::read(dir.path().join("source/0.mp4")).unwrap();
     let mut batch = plan(settings.clone(), candidates.clone(), &Cancel::default())

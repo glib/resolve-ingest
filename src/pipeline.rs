@@ -3,7 +3,7 @@ use crate::{
     media,
     model::*,
     settings::{Destination, Settings, Workflow},
-    storage::{Root, reject_overlap, safe_relative},
+    storage::{Root, portable_name, reject_overlap},
     verification,
 };
 use anyhow::{Context, Result, ensure};
@@ -23,11 +23,18 @@ pub async fn plan(
         return plan_conversion(settings, candidates, cancel).await;
     }
     let skipped = candidates.iter().filter(|c| !c.selected).count();
-    let selected: Vec<_> = candidates.into_iter().filter(|c| c.selected).collect();
+    let mut selected: Vec<_> = candidates.into_iter().filter(|c| c.selected).collect();
     ensure!(
         !selected.is_empty(),
         "Select at least one original to archive."
     );
+    // Newest recordings first: the footage most likely to be edited next is ready soonest.
+    selected.sort_by_cached_key(|c| {
+        (
+            std::cmp::Reverse(crate::catalog::recorded(c).date),
+            c.relative.clone(),
+        )
+    });
     let archive = settings
         .archive
         .as_ref()
@@ -64,44 +71,19 @@ pub async fn plan(
         None
     };
     let id = uuid::Uuid::new_v4().to_string();
-    let base = PathBuf::from(chrono::Utc::now().format("%Y-%m-%d").to_string()).join(&id);
+    let verify = settings.verify;
+    let names = plan_names(&selected, &ar, ed.as_ref())?;
     let mut items = Vec::new();
     let mut archive_bytes = 0u64;
     let mut editing_bytes = 0u64;
-    for c in selected {
+    for (c, (archive_path, editing_path)) in selected.into_iter().zip(names) {
         cancel.check()?;
-        ensure!(
-            c.relative.to_str().is_some(),
-            "Non-UTF8 filenames cannot be journaled in v1: {:?}. Rename a copy before ingest.",
-            c.relative
-        );
         let file = source.read(&c.relative)?;
         ensure!(
             Identity::of(&file.metadata()?) == c.identity,
             "Source changed since scanning: {}. Rescan the card.",
             c.relative.display()
         );
-        let safe = safe_relative(&c.relative)?;
-        let archive_path = base.join("originals").join(&safe);
-        // Retain the encoded original extension and append .mov: same-stem inputs stay distinct.
-        let editing_path = c.editing.then(|| {
-            base.join("clips").join(&safe).with_file_name(format!(
-                "{}.mov",
-                safe.file_name().unwrap().to_string_lossy()
-            ))
-        });
-        ensure!(
-            !ar.exists(&archive_path)?,
-            "Archive conflict: {}",
-            archive_path.display()
-        );
-        if let Some(p) = &editing_path {
-            ensure!(
-                !ed.as_ref().unwrap().exists(p)?,
-                "Editing conflict: {}",
-                p.display()
-            );
-        }
         archive_bytes = archive_bytes
             .checked_add(c.identity.size)
             .context("Batch size overflow")?;
@@ -157,7 +139,7 @@ pub async fn plan(
         id,
         created_at: now(),
         settings,
-        profile: media::PROFILE.into(),
+        profile: media::profile(verify).into(),
         tools,
         items,
         skipped,
@@ -167,6 +149,117 @@ pub async fn plan(
         storage_notes: notes,
     })
 }
+/// Readable destination names: `<recorded day>/<camera filename>` and `<day>/<stem>.mov`.
+/// Names already used on disk or earlier in this batch (compared case-insensitively, for SMB
+/// and exFAT) get a `-2`, `-3`… suffix; sidecars share their clip's suffix where possible.
+fn plan_names(
+    selected: &[Candidate],
+    ar: &Root,
+    ed: Option<&Root>,
+) -> Result<Vec<(PathBuf, Option<PathBuf>)>> {
+    let day = |c: &Candidate| {
+        let owner = c
+            .sidecar_for
+            .as_ref()
+            .and_then(|v| selected.iter().find(|o| &o.relative == v))
+            .unwrap_or(c);
+        PathBuf::from(crate::catalog::recorded_day(owner).to_string())
+    };
+    let mut archive = Namer::new(ar);
+    let mut editing = ed.map(Namer::new);
+    let mut suffix = std::collections::HashMap::new();
+    let mut names = vec![None; selected.len()];
+    // Clips claim names before their sidecars so the pair keeps matching stems.
+    let mut order: Vec<_> = (0..selected.len()).collect();
+    order.sort_by_key(|&i| selected[i].sidecar_for.is_some());
+    for i in order {
+        let c = &selected[i];
+        let name = portable_name(c.relative.file_name().context("Missing source filename")?)?;
+        let (stem, ext) = match name.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
+            _ => (name.clone(), String::new()),
+        };
+        let dir = day(c);
+        let prefer = c
+            .sidecar_for
+            .as_ref()
+            .and_then(|v| suffix.get(v).copied())
+            .unwrap_or(1);
+        let (archive_path, n) = archive.claim(&dir, &stem, &ext, prefer)?;
+        suffix.insert(c.relative.clone(), n);
+        let editing_path = if c.editing {
+            let namer = editing.as_mut().context("Choose an editing destination.")?;
+            Some(namer.claim(&dir, &stem, ".mov", n)?.0)
+        } else {
+            None
+        };
+        names[i] = Some((archive_path, editing_path));
+    }
+    Ok(names.into_iter().map(Option::unwrap).collect())
+}
+struct Namer<'a> {
+    root: &'a Root,
+    taken: std::collections::HashSet<String>,
+}
+impl<'a> Namer<'a> {
+    fn new(root: &'a Root) -> Self {
+        Self {
+            root,
+            taken: Default::default(),
+        }
+    }
+    fn reserve(&mut self, path: &Path) {
+        self.taken.insert(path.to_string_lossy().to_lowercase());
+    }
+    fn claim(&mut self, dir: &Path, stem: &str, ext: &str, prefer: u32) -> Result<(PathBuf, u32)> {
+        for n in prefer.max(1)..10_000 {
+            let name = if n == 1 {
+                format!("{stem}{ext}")
+            } else {
+                format!("{stem}-{n}{ext}")
+            };
+            let path = dir.join(name);
+            if !self.taken.contains(&path.to_string_lossy().to_lowercase())
+                && !self.root.exists(&path)?
+            {
+                self.reserve(&path);
+                return Ok((path, n));
+            }
+        }
+        anyhow::bail!("No free name for {stem}{ext} in {}", dir.display())
+    }
+}
+
+/// Marks candidates whose verified original is already in this archive and leaves them
+/// unselected. A recorded copy counts only while it is still present at its recorded size.
+pub fn mark_archived(
+    jobs: &Jobs,
+    archive: &Destination,
+    candidates: &mut [Candidate],
+) -> Result<usize> {
+    let known = jobs.archived(&archive.path)?;
+    if known.is_empty() {
+        return Ok(0);
+    }
+    let root = Root::destination(archive)?;
+    let mut count = 0;
+    for c in candidates {
+        let Some((path, bytes)) = c.fingerprint.as_ref().and_then(|f| known.get(f)) else {
+            continue;
+        };
+        let present = root
+            .read(path)
+            .and_then(|f| Ok(f.metadata()?.len()))
+            .is_ok_and(|len| len == *bytes);
+        if present {
+            c.archived = Some(path.clone());
+            c.selected = false;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn checked_destination(destination: &Destination, label: &str) -> Result<(Root, String)> {
     let check = || {
         let root = Root::destination(destination)?;
@@ -244,11 +337,42 @@ pub async fn run(
     cancel: &Cancel,
     events: &Events,
 ) -> Result<()> {
+    ensure!(
+        only.is_none_or(|i| i < batch.items.len()),
+        "Item index out of range"
+    );
+    let items: Vec<_> = match only {
+        Some(i) => vec![i],
+        None => (0..batch.items.len()).collect(),
+    };
+    run_items(jobs, batch, &items, cancel, events).await
+}
+
+/// Retries only items that are not complete; verified items are not rechecked.
+pub async fn retry_incomplete(
+    jobs: &mut Jobs,
+    batch: &mut Batch,
+    cancel: &Cancel,
+    events: &Events,
+) -> Result<()> {
+    let items: Vec<_> = (0..batch.items.len())
+        .filter(|&i| !batch.items[i].complete())
+        .collect();
+    run_items(jobs, batch, &items, cancel, events).await
+}
+
+async fn run_items(
+    jobs: &mut Jobs,
+    batch: &mut Batch,
+    items: &[usize],
+    cancel: &Cancel,
+    events: &Events,
+) -> Result<()> {
     let workflow = batch.settings.workflow;
     run_with_lanes(
         jobs,
         batch,
-        only,
+        Some(items),
         cancel,
         events,
         workers::Lanes::for_workflow(workflow),
@@ -259,25 +383,24 @@ pub async fn run(
 async fn run_with_lanes(
     jobs: &mut Jobs,
     batch: &mut Batch,
-    only: Option<usize>,
+    only: Option<&[usize]>,
     cancel: &Cancel,
     events: &Events,
     lanes: workers::Lanes,
 ) -> Result<()> {
     use std::collections::VecDeque;
     use workers::{Change, Save, Update, Work};
+    batch.settings.verify = media::verify_for_profile(&batch.profile).context(
+        "This batch uses a different conversion profile. Use its original application version.",
+    )?;
     ensure!(
-        batch.profile == media::PROFILE,
-        "This batch uses a different conversion profile. Use its original application version."
-    );
-    ensure!(
-        only.is_none_or(|i| i < batch.items.len()),
+        only.is_none_or(|items| items.iter().all(|&i| i < batch.items.len())),
         "Item index out of range"
     );
     batch.status = "Running".into();
     jobs.save(batch)?;
     let mut queue: VecDeque<_> = (0..batch.items.len())
-        .filter(|i| only.is_none_or(|n| n == *i))
+        .filter(|i| only.is_none_or(|items| items.contains(i)))
         .map(|i| (i, 0u64))
         .collect();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Update>(8);
@@ -515,20 +638,7 @@ pub async fn prepare_archived_editing(
         probe.video().is_some_and(|v| v.pix_fmt.is_some()) && probe.duration() > 0.,
         "No decodable motion video. Keep this file archive only."
     );
-    let mut parts = item.archive_path.components();
-    let base: PathBuf = parts.by_ref().take(2).collect();
-    ensure!(
-        parts.next().is_some_and(|c| c.as_os_str() == "originals"),
-        "Unrecognized archive path layout"
-    );
-    let relative: PathBuf = parts.collect();
-    let target = base.join("clips").join(&relative).with_file_name(format!(
-        "{}.mov",
-        relative
-            .file_name()
-            .context("Missing source filename")?
-            .to_string_lossy()
-    ));
+    let target = archived_editing_target(batch, index, &ed)?;
     ensure!(
         !ed.exists(&target)?,
         "Editing target already exists. Inspect the conflict before requesting conversion."
@@ -545,6 +655,35 @@ pub async fn prepare_archived_editing(
     item.error = None;
     batch.status = "Editing requested · ready to retry".into();
     record(jobs, batch, index, events)
+}
+
+/// Editing name for a previously archive-only item, beside its archive layout.
+fn archived_editing_target(batch: &Batch, index: usize, ed: &Root) -> Result<PathBuf> {
+    let item = &batch.items[index];
+    let mut parts = item.archive_path.components();
+    let base: PathBuf = parts.by_ref().take(2).collect();
+    if parts.next().is_some_and(|c| c.as_os_str() == "originals") {
+        // Batches from before readable layouts: `<date>/<batch>/originals/<encoded path>`.
+        let relative: PathBuf = parts.collect();
+        return Ok(base.join("clips").join(&relative).with_file_name(format!(
+            "{}.mov",
+            relative
+                .file_name()
+                .context("Missing source filename")?
+                .to_string_lossy()
+        )));
+    }
+    let mut namer = Namer::new(ed);
+    for other in batch.items.iter().filter_map(|i| i.editing_path.as_ref()) {
+        namer.reserve(other);
+    }
+    let stem = item
+        .archive_path
+        .file_stem()
+        .context("Missing archive filename")?
+        .to_string_lossy();
+    let dir = item.archive_path.parent().unwrap_or(Path::new(""));
+    Ok(namer.claim(dir, &stem, ".mov", 1)?.0)
 }
 
 pub fn copy_file_identity(file: &File) -> Result<Identity> {
@@ -629,8 +768,8 @@ async fn plan_conversion(
     );
     settings.archive = None;
     Ok(Batch {
-        schema: 1, id: uuid::Uuid::new_v4().to_string(), created_at: now(), settings,
-        profile: media::PROFILE.into(), tools: Some(media::check_tools(cancel).await?),
+        profile: media::profile(settings.verify).into(),
+        schema: 1, id: uuid::Uuid::new_v4().to_string(), created_at: now(), settings, tools: Some(media::check_tools(cancel).await?),
         items, skipped, status: "Ready".into(), archive_bytes: 0, editing_bytes: bytes,
         storage_notes: vec![note, "Conversion only: source files stay in place; outputs append .mov to the original filename.".into()],
     })

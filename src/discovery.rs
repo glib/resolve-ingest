@@ -10,7 +10,8 @@ pub async fn scan(path: &Path, cancel: &Cancel) -> Result<Vec<Candidate>> {
     scan_with_progress(path, cancel, false, |_, _| {}).await
 }
 
-/// Conversion scans omit nested Resolve-generated folders. Archive scans retain every original.
+/// Conversion scans omit nested Resolve-generated folders. Archive scans retain every original
+/// except hidden filesystem bookkeeping (`.Trashes`, `._*` AppleDouble files, and similar).
 /// The callback runs before each probe so even a slow file is identified to the user.
 pub async fn scan_with_progress(
     path: &Path,
@@ -27,23 +28,29 @@ pub async fn scan_with_progress(
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|entry| {
-            !(exclude_resolve_generated
-                && entry.depth() > 0
-                && entry.file_type().is_dir()
-                && [
-                    "CacheClip",
-                    "ProxyMedia",
-                    "Proxy",
-                    ".gallery",
-                    "Resolve Project Backups",
-                ]
-                .iter()
-                .any(|name| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(name)
-                }))
+            // Hidden entries and Windows' system folder are filesystem bookkeeping, not footage.
+            let name = entry.file_name().to_string_lossy();
+            let junk = entry.depth() > 0
+                && (name.starts_with('.')
+                    || name.eq_ignore_ascii_case("System Volume Information"));
+            !junk
+                && !(exclude_resolve_generated
+                    && entry.depth() > 0
+                    && entry.file_type().is_dir()
+                    && [
+                        "CacheClip",
+                        "ProxyMedia",
+                        "Proxy",
+                        ".gallery",
+                        "Resolve Project Backups",
+                    ]
+                    .iter()
+                    .any(|name| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(name)
+                    }))
         })
     {
         cancel.check()?;
@@ -55,6 +62,12 @@ pub async fn scan_with_progress(
         progress(items.len(), &relative);
         let file = root.read(&relative)?;
         let identity = Identity::of(&file.metadata()?);
+        let fingerprint = Some(crate::catalog::fingerprint(&file).with_context(|| {
+            format!(
+                "Cannot read {}. Check card access and rescan.",
+                relative.display()
+            )
+        })?);
         let ext = entry
             .path()
             .extension()
@@ -81,6 +94,8 @@ pub async fn scan_with_progress(
             selected: editing || candidate,
             editing,
             sidecar_for: None,
+            fingerprint,
+            archived: None,
         });
     }
     let videos: Vec<_> = items

@@ -29,11 +29,12 @@ async fn main() -> Result<()> {
         selected: true,
         editing: true,
         sidecar_for: None,
+        ..Default::default()
     };
     let settings = Settings {
         source: input.parent().unwrap().into(),
-        archive: Some(Destination::select(output.join("archive"), false)?),
-        editing: Some(Destination::select(output.join("editing"), false)?),
+        archive: Some(Destination::select(output.join("archive"))?),
+        editing: Some(Destination::select(output.join("editing"))?),
         ..Default::default()
     };
     let mut batch = pipeline::plan(settings, vec![candidate], &cancel).await?;

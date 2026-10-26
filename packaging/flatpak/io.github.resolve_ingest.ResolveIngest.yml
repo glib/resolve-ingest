@@ -8,15 +8,19 @@ sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
 command: resolve-ingest
 
-# GTK uses the desktop display sockets. Media locations are deliberately not
-# exposed with --filesystem=host; home is the default scope for local files.
-# Add a narrowly-scoped override for an OS-mounted CIFS path under /mnt or
-# /run/media when needed (see README.md).
+# Media locations are scoped rather than --filesystem=host: home for local
+# folders, /run/media for camera cards and external drives (udisks mounts them
+# there), and /mnt for system-mounted NAS shares. gvfs provides card
+# notifications and eject. Other mount points need an override (README.md).
 finish-args:
   - --share=ipc
   - --socket=wayland
   - --socket=fallback-x11
   - --filesystem=home
+  - --filesystem=/run/media
+  - --filesystem=/mnt
+  - --filesystem=xdg-run/gvfsd
+  - --talk-name=org.gtk.vfs.*
 
 modules:
   # The application launches both tools itself. They must be inside the

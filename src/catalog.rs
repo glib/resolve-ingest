@@ -1,6 +1,25 @@
 //! Display metadata for scanned files. Filesystem ctime is not a recording date.
 use crate::model::Candidate;
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use sha2::{Digest, Sha256};
+use std::{fs::File, os::unix::fs::FileExt};
+
+const SAMPLE: u64 = 1024 * 1024;
+
+/// Size and SHA-256 of the first and last MiB. Reads at most 2 MiB, so a whole card can be
+/// compared with earlier ingests quickly; copies still get a full SHA-256.
+pub fn fingerprint(file: &File) -> std::io::Result<String> {
+    let size = file.metadata()?.len();
+    let mut sha = Sha256::new();
+    sha.update(size.to_le_bytes());
+    let mut buffer = vec![0; SAMPLE as usize];
+    for offset in [0, size.saturating_sub(SAMPLE).max(SAMPLE.min(size))] {
+        let want = SAMPLE.min(size - offset) as usize;
+        file.read_exact_at(&mut buffer[..want], offset)?;
+        sha.update(&buffer[..want]);
+    }
+    Ok(format!("v1:{size}:{:x}", sha.finalize()))
+}
 
 pub struct Recorded {
     pub date: NaiveDateTime,
@@ -12,6 +31,10 @@ pub fn file_type(c: &Candidate) -> String {
         .map(|s| s.to_string_lossy().to_uppercase())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "No extension".into())
+}
+/// Folder date for archive and editing layouts.
+pub fn recorded_day(c: &Candidate) -> NaiveDate {
+    recorded(c).date.date()
 }
 pub fn recorded(c: &Candidate) -> Recorded {
     let name = c.relative.file_stem().unwrap_or_default().to_string_lossy();
@@ -61,11 +84,14 @@ pub fn recorded(c: &Candidate) -> Recorded {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Identity;
     fn candidate(name: &str) -> Candidate {
-        Candidate { relative: name.into(), identity: Identity { dev: 0, ino: 0, size: 0, mtime: 0, mtime_ns: 0, ctime: 0, ctime_ns: 0 },
+        Candidate {
+            relative: name.into(),
             probe: Some(serde_json::from_value(serde_json::json!({"streams":[],"format":{"tags":{"creation_time":"2025-01-02T03:04:05Z"}}})).unwrap()),
-            probe_error: None, selected: true, editing: true, sidecar_for: None }
+            selected: true,
+            editing: true,
+            ..Default::default()
+        }
     }
     #[test]
     fn recording_dates_prefer_valid_filename_then_media_then_modified() {
@@ -82,5 +108,23 @@ mod tests {
         assert!(recorded(&c).origin.contains("modification"));
         assert_eq!(file_type(&candidate("clip.mP4")), "MP4");
         assert_eq!(file_type(&candidate("extensionless")), "No extension");
+    }
+    #[test]
+    fn fingerprints_cover_size_head_and_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let print = |bytes: &[u8]| {
+            let path = dir.path().join("f");
+            std::fs::write(&path, bytes).unwrap();
+            fingerprint(&File::open(path).unwrap()).unwrap()
+        };
+        let big = vec![7u8; 3 * SAMPLE as usize];
+        let mut tail = big.clone();
+        *tail.last_mut().unwrap() = 8;
+        let mut middle = big.clone();
+        middle[SAMPLE as usize + 10] = 8;
+        assert_ne!(print(&big), print(&tail));
+        assert_eq!(print(&big), print(&middle), "middle bytes are not sampled");
+        assert_ne!(print(b"short"), print(b"shorT"));
+        assert_eq!(print(b""), print(b""));
     }
 }

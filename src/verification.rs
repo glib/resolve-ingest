@@ -135,12 +135,10 @@ pub fn structure(source: &Probe, output: &Probe) -> Result<Vec<String>> {
         "video duration",
     )?;
     let mut notices = Vec::new();
-    for key in ["timecode"] {
-        if video.tags[key] != dest.tags[key] {
-            notices.push(format!(
-                "Editing metadata differs: video {key}. Original retains source metadata."
-            ));
-        }
+    if video.tags["timecode"] != dest.tags["timecode"] {
+        notices.push(
+            "Editing metadata differs: video timecode. Original retains source metadata.".into(),
+        );
     }
     let rotation = |s: &crate::media::Stream| {
         s.side_data_list
