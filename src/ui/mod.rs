@@ -41,6 +41,7 @@ struct Ui {
     banner: adw::Banner,
     stack: gtk::Stack,
     setup_rows: [adw::ActionRow; 2],
+    setup_hint: gtk::Label,
     cards: gtk::ListBox,
     shown_cards: RefCell<Vec<Card>>,
     waiting_chips: [gtk::Button; 2],
@@ -278,6 +279,19 @@ fn perform(app: &Rc<App>, effect: Effect) {
         }
         Effect::ApplyAppearance => apply_appearance(app),
         Effect::Toast(text) => toast(app, &text),
+        Effect::Alert { heading, body } => {
+            // Selectable, so commands in the explanation can be copied.
+            let text = gtk::Label::builder()
+                .label(&body)
+                .wrap(true)
+                .selectable(true)
+                .justify(gtk::Justification::Center)
+                .build();
+            let dialog = adw::AlertDialog::new(Some(&heading), None);
+            dialog.set_extra_child(Some(&text));
+            dialog.add_response("ok", "OK");
+            dialog.present(Some(&ui.window));
+        }
         Effect::Notify { title, body } => {
             if !ui.window.is_active()
                 && let Some(application) = ui.window.application()
@@ -412,11 +426,26 @@ fn build_ui(application: &adw::Application, app: &Rc<App>) -> Ui {
     for row in &setup_rows {
         setup_list.append(row);
     }
+    let setup_hint = gtk::Label::new(None);
+    setup_hint.add_css_class("dim-label");
+    setup_hint.set_wrap(true);
+    setup_hint.set_justify(gtk::Justification::Center);
+    let setup_convert = gtk::Button::with_label("Convert Existing Files…");
+    setup_convert.add_css_class("flat");
+    setup_convert.set_halign(gtk::Align::Center);
+    setup_convert.set_action_name(Some("win.convert"));
+    setup_convert.set_tooltip_text(Some(
+        "Make editing copies of footage already on disk. No archive needed.",
+    ));
+    let setup_box = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    setup_box.append(&setup_list);
+    setup_box.append(&setup_hint);
+    setup_box.append(&setup_convert);
     let setup = status_page(
         "folder-download-symbolic",
         "Where should footage go?",
         "Originals are copied to the archive and checked byte for byte. Editing copies keep the camera's video and get 24-bit PCM audio for Resolve.",
-        &clamp(&setup_list, 520),
+        &clamp(&setup_box, 520),
     );
     stack.add_named(&setup, Some("setup"));
 
@@ -720,6 +749,7 @@ fn build_ui(application: &adw::Application, app: &Rc<App>) -> Ui {
         banner,
         stack,
         setup_rows,
+        setup_hint,
         cards,
         shown_cards: RefCell::new(vec![]),
         waiting_chips,
@@ -1040,6 +1070,7 @@ fn render(app: &Rc<App>) {
     for ((row, path), info) in ui.setup_rows.iter().zip(paths).zip(infos) {
         row.set_subtitle(&location_subtitle(path, info));
     }
+    ui.setup_hint.set_text(model.setup_hint());
     if let Some(rows) = ui.prefs.borrow().as_ref() {
         rows.render(&model);
     }

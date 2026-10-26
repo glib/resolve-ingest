@@ -60,7 +60,13 @@ distrobox-host-exec flatpak override --user --filesystem=/var/mnt/footage:rw \
   io.github.resolve_ingest.ResolveIngest
 ```
 
-Mount network shares through the system (fstab or system settings), not as `smb://` locations in the file manager. Those GVfs paths are refused. Flatpak settings and the journal live under `~/.var/app/io.github.resolve_ingest.ResolveIngest/`. If `Cargo.lock` changes, run `python3 packaging/flatpak/generate-cargo-sources.py` before building.
+Mount network shares through the system, not as `smb://` locations in Dolphin or Files. Those file-manager locations aren't real mounts and are refused. On Bazzite, a share that mounts itself on first use looks like this in `/etc/fstab` (use `credentials=/etc/samba/credentials/NAS` with a root-only file instead of `guest` if the share needs a login):
+
+```
+//homenas.local/Resolve /var/mnt/resolve cifs guest,uid=1000,gid=1000,iocharset=utf8,_netdev,nofail,x-systemd.automount 0 0
+```
+
+Then `sudo systemctl daemon-reload && sudo systemctl start var-mnt-resolve.automount`, and grant the Flatpak access with the `flatpak override` line above. Flatpak settings and the journal live under `~/.var/app/io.github.resolve_ingest.ResolveIngest/`. If `Cargo.lock` changes, run `python3 packaging/flatpak/generate-cargo-sources.py` before building.
 
 ### From source
 

@@ -24,10 +24,18 @@ impl Destination {
             !matches!(mount.fs_type.as_str(), "9p" | "ceph" | "afs"),
             "This network filesystem is unsupported. Select local storage or a CIFS/NFS share mounted by the operating system."
         );
-        ensure!(
-            !mount.fs_type.starts_with("fuse"),
-            "GVfs/FUSE locations are unsupported. Mount the drive or share through the operating system, then select its folder."
-        );
+        match mount.fs_type.as_str() {
+            "fuse.kio-fuse" | "fuse.gvfsd-fuse" => anyhow::bail!(
+                "This is a file manager network location (smb://), not a mounted share. Mount the share through the system, for example with an /etc/fstab entry, then choose its folder."
+            ),
+            "fuse.portal" => anyhow::bail!(
+                "The app has no direct access to this folder, only a sandbox copy. Grant access with `flatpak override --user --filesystem=PATH:rw io.github.resolve_ingest.ResolveIngest`, restart, and choose it again."
+            ),
+            fs => ensure!(
+                !fs.starts_with("fuse"),
+                "FUSE locations are unsupported. Mount the drive or share through the operating system, then select its folder."
+            ),
+        }
         Ok(Self {
             path,
             expected_mount: mount.durable_id(),

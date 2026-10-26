@@ -214,6 +214,11 @@ pub enum Effect {
     SaveSettings,
     ApplyAppearance,
     Toast(String),
+    /// A problem the user has to read in full, such as why a folder was refused.
+    Alert {
+        heading: String,
+        body: String,
+    },
     Notify {
         title: String,
         body: String,
@@ -257,6 +262,15 @@ impl Model {
 
     pub fn configured(&self) -> bool {
         self.settings.archive.is_some() && self.settings.editing.is_some()
+    }
+    /// What the setup screen still needs, in words.
+    pub fn setup_hint(&self) -> &'static str {
+        match (&self.settings.archive, &self.settings.editing) {
+            (None, None) => "Choose both folders to start ingesting cards.",
+            (None, Some(_)) => "Choose an archive folder to continue.",
+            (Some(_), None) => "Choose an editing copies folder to continue.",
+            (Some(_), Some(_)) => "",
+        }
     }
     fn idle_screen(&self) -> Screen {
         if self.configured() {
@@ -819,7 +833,10 @@ impl Model {
                     }
                     effects
                 }
-                Err(e) => vec![Effect::Toast(first_line(&e))],
+                Err(e) => vec![Effect::Alert {
+                    heading: "Can't use this folder".into(),
+                    body: e,
+                }],
             },
             Reply::Locations { archive, editing } => {
                 self.locations = Locations { archive, editing };
@@ -1460,12 +1477,33 @@ mod tests {
             result: Ok(destination("a")),
         }));
         assert_eq!(m.screen, Screen::Setup);
+        assert_eq!(
+            m.setup_hint(),
+            "Choose an editing copies folder to continue."
+        );
         let effects = m.update(Msg::Reply(Reply::Destination {
             kind: DestinationKind::Editing,
             result: Ok(destination("e")),
         }));
         assert_eq!(m.screen, Screen::Waiting);
         assert!(effects.contains(&Effect::SaveSettings));
+    }
+
+    #[test]
+    fn a_refused_folder_is_explained_in_full() {
+        let mut m = Model::new(Settings::default());
+        let effects = m.update(Msg::Reply(Reply::Destination {
+            kind: DestinationKind::Archive,
+            result: Err("Not a mounted share.\nMount it first.".into()),
+        }));
+        assert_eq!(m.screen, Screen::Setup);
+        assert!(
+            matches!(&effects[..], [Effect::Alert { body, .. }] if body.contains("Mount it first"))
+        );
+        assert_eq!(
+            m.setup_hint(),
+            "Choose both folders to start ingesting cards."
+        );
     }
 
     #[test]
